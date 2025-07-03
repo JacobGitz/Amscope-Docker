@@ -1,0 +1,8 @@
+# 1) ignore everything in this directory
+*
+
+# 2) but don’t ignore this file (whitelist it)
+!legacy-tdc001-image.tar
+
+# 3) never ignore the .gitignore itself
+!.gitignore

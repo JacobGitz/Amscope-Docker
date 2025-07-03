@@ -1,0 +1,14 @@
+services:
+  tdc_frontend:
+    #network_mode: "host" this breaks windows compatibility, so I am commenting it out.
+    build:
+      context: ./Gui # path to Dockerfile.gui
+      dockerfile: Dockerfile.gui
+    image: tdc001-gui              # cache tag
+    container_name: tdc_frontend
+    environment:
+      # override if your backend is elsewhere
+      - TZ=America/New_York
+    ports:
+      - "6080:6080"                # http://localhost:6080 shows the GUI
+
