@@ -36,7 +36,7 @@ I cannot stress this enough, if you do not include this file, you will make code
 
 Even with this file, sometimes the old packages are not provided on the internet (or downloadable by pip install); For these reasons, I have included a "wheelhouse" directory, which fixes this problem. 
 
--------------------TDC001-project------------------------------------------
+-------------------Project------------------------------------------
 
 This directory contains all the scripts that build up the GUI, API, and controller for making this whole project work for the TDC001 thorlabs stepper driver.
 
@@ -58,9 +58,9 @@ ALSO ALWAYS MAKE THIS FOR ANYTHING IN PYTHON. This directory is known as a pytho
 
 A virtual environment stores the python version, all dependencies, everything. It is a self contained python install for running your scripts in a project. 
 
-By default, a "gitignore" file is included when you create a virtual environment directory. Delete this. If you delete it, it will commit the venv file to github when you push your project. Therefore, anyone who downloads this project can enter this virtual environment from the command line.
+You can use this already existing .venv file by typing "source .venv/bin/activate" in Linux (command line or terminal). 
 
-You can use this already existing .venv file by typing ".venv/Scripts/activate" in Windows and "source .venv/bin/activate" in Linux (command line or terminal). 
+If on Windows, you may need to create a new venv, or use windows subsystem linux (wsl)
 
 Once you do this, you can run any script I have made normally. Pretty useful.
 

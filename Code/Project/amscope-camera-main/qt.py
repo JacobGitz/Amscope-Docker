@@ -26,7 +26,7 @@ class SnapWin(QWidget):
 class MainWin(QWidget):
     eventImage = pyqtSignal(int)
 
-    def __init__(self, gain=100, integration_time=10.0, res="low"):
+    def __init__(self, gain=100, integration_time=1000, res="low"):
         super().__init__()
         self.hcam = None
         self.buf = None      # video buffer
@@ -134,4 +134,10 @@ class MainWin(QWidget):
         if self.hcam is not None:
             self.hcam.Close()
             self.hcam = None
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)          # 1️⃣ create the application object
+    win = MainWin()              # 2️⃣ build your window
+    win.show()                            #    make it visible
+    sys.exit(app.exec())                  # 3️⃣ start the event loop
 
