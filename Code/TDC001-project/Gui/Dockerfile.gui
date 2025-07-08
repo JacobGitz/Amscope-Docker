@@ -1,0 +1,73 @@
+# ------------ gui/Dockerfile (v3b – always interactive) ------------------
+FROM python:3.13-slim AS gui
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    QT_X11_NO_MITSHM=1
+
+# ------------------------------------------------------------------------
+# 1.  Packages  (unchanged except: keep libxtst6 for input events)
+# ------------------------------------------------------------------------
+RUN set -eux; \
+    apt-get update -y; \
+    apt-get install -y --no-install-recommends \
+        xvfb x11vnc websockify novnc fluxbox \
+        xauth libxtst6 x11-utils wmctrl \
+        libx11-6 libxext6 libxrender1 libxkbcommon-x11-0 \
+        libxcb1 libx11-xcb1 libxcb-cursor0 libxcb-xinerama0 \
+        libxcb-image0 libxcb-keysyms1 libxcb-icccm4 libxcb-randr0 \
+        libxcb-render0 libxcb-render-util0 libxcb-shape0 libxcb-shm0 \
+        libxcb-sync1 libxcb-xfixes0 \
+        libegl1 libgl1-mesa-glx libxfont2 xfonts-base \
+        libfontconfig1 libfreetype6 fonts-dejavu-core ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# ------------------------------------------------------------------------
+# 2.  Python deps
+# ------------------------------------------------------------------------
+COPY wheelhouse /wheelhouse
+COPY requirements.lock /tmp/req.lock
+RUN if [ -d /wheelhouse ]; then \
+        pip install --no-index --find-links=/wheelhouse -r /tmp/req.lock ;\
+    else \
+        pip install --no-cache-dir -r /tmp/req.lock ;\
+    fi
+
+# ------------------------------------------------------------------------
+# 3.  App source
+# ------------------------------------------------------------------------
+COPY . /app
+WORKDIR /app
+
+# ------------------------------------------------------------------------
+# 4.  **Wrapper page** that forces interactive mode
+# ------------------------------------------------------------------------
+RUN printf '%s\n' \
+'<!DOCTYPE html>' \
+'<html><head><meta charset="utf-8"><title>TDC001 GUI</title>' \
+'<meta http-equiv="refresh" content="0; url=vnc.html?host=localhost&port=6080&view_only=false&autoconnect=1">' \
+'</head><body>' \
+'If you are not redirected automatically, <a href="vnc.html?host=localhost&port=6080&view_only=false&autoconnect=1">click here</a>.' \
+'</body></html>' \
+> /usr/share/novnc/index.html
+
+# ------------------------------------------------------------------------
+# 5.  Start-up script (unchanged apart from the URL we print)
+# ------------------------------------------------------------------------
+RUN printf '%s\n' \
+'#!/usr/bin/env bash' \
+'set -euo pipefail' \
+'export DISPLAY=:99' \
+'rm -f /tmp/.X99-lock /tmp/.X11-unix/X99' \
+'Xvfb $DISPLAY -screen 0 1920x1080x24 -nolisten tcp &' \
+'for i in {1..40}; do xdpyinfo -display $DISPLAY >/dev/null 2>&1 && break; sleep 0.25; done' \
+'fluxbox -display $DISPLAY 2>/dev/null &' \
+'x11vnc -display $DISPLAY -forever -shared -nopw -rfbport 5900 -bg' \
+'websockify --web=/usr/share/novnc 0.0.0.0:6080 localhost:5900 &' \
+'echo "[GUI] ready → open  http://localhost:6080/   (interactive by default)"' \
+'exec python /app/run.py' \
+> /usr/local/bin/start-gui.sh && chmod +x /usr/local/bin/start-gui.sh
+
+EXPOSE 6080
+CMD ["/usr/local/bin/start-gui.sh"]
+

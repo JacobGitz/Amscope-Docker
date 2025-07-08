@@ -36,9 +36,9 @@ I cannot stress this enough, if you do not include this file, you will make code
 
 Even with this file, sometimes the old packages are not provided on the internet (or downloadable by pip install); For these reasons, I have included a "wheelhouse" directory, which fixes this problem. 
 
--------------------Project------------------------------------------
+-------------------TDC001-Project(incorrectly named)------------------------------------------
 
-This directory contains all the scripts that build up the GUI, API, and controller for making this whole project work for the TDC001 thorlabs stepper driver.
+This directory contains all the scripts that build up the GUI, API, and controller for making this whole project work for the amscope camera.
 
 In an ideal world, this directory will build 2 docker containers, one for the controller's api, another for the GUI. Hopefully, they network together and work amazing with zero problems.
 
