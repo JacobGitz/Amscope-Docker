@@ -58,6 +58,7 @@ ALSO ALWAYS MAKE THIS FOR ANYTHING IN PYTHON. This directory is known as a pytho
 
 A virtual environment stores the python version, all dependencies, everything. It is a self contained python install for running your scripts in a project. 
 
+enter random text here
 You can use this already existing .venv file by typing "source .venv/bin/activate" in Linux (command line or terminal). 
 
 If on Windows, you may need to create a new venv, or use windows subsystem linux (wsl)
