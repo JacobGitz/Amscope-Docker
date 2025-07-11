@@ -63,25 +63,23 @@ class CameraController:
     def __init__(self, dev: amcam.Amcam):
         self.hcam = dev
 
-        # Choose initial resolution (use SDK default: entry 2 = 640×480)
+        # pick default preview resolution (entry 2 = 640×480)
         self.hcam.put_eSize(2)
         self.w, self.h = self.hcam.get_Size()
 
-        # Single pre-allocated buffer (RGB888 → stride rounded to 4 bytes)
+        # ---- new line --------------------------------------------------
+        self._raw_lock = threading.Lock()         # protect _latest_raw
+        # ----------------------------------------------------------------
+
         stride = ((self.w * 24 + 31) // 32) * 4
         self.buf = ctypes.create_string_buffer(stride * self.h)
         self.stride = stride
 
-        # Thread-safe latest PNG
-        self._frame_lock = threading.Lock()
-        self._latest_png: Optional[bytes] = None
-
-        # FPS measurement
+        self._latest_raw: bytes | None = None     # most-recent RGB frame
         self._frame_count = 0
         self._last_tick = time.perf_counter()
         self.fps = 0.0
 
-        # Start streaming
         self.hcam.StartPullModeWithCallback(self._sdk_cb, self)
 
     # ——— SDK callback runs on internal thread ————————————————
@@ -95,19 +93,8 @@ class CameraController:
             ctx.hcam.PullImageV2(ctx.buf, 24, None)
         except amcam.HRESULTException:
             return                                              # drop
-
-        # Convert to PNG in-memory
-        img = Image.frombuffer(
-            "RGB", (ctx.w, ctx.h), ctx.buf, "raw",
-            "BGR" if ctx.hcam.get_Option(amcam.AMCAM_OPTION_BYTEORDER) else "RGB",
-            0, 1
-        )
-        bio = io.BytesIO()
-        img.save(bio, format="PNG")
-
-        # Publish
-        with ctx._frame_lock:
-            ctx._latest_png = bio.getvalue()
+        with ctx._raw_lock:
+            ctx._latest_raw = bytes(ctx.buf)    # copy 1:1, no PNG
 
         # FPS counter
         ctx._frame_count += 1
@@ -124,40 +111,6 @@ class CameraController:
                 raise RuntimeError("No frame yet")
             return self._latest_png
 
-    def snapshot_png(self) -> bytes:
-        """Blocking still image capture (≈200 ms)."""
-        ev = threading.Event()
-
-        # local-scope buffer to avoid clobbering live view
-        buf = ctypes.create_string_buffer(self.stride * self.h)
-
-        def cb(event, ctx):
-            if event == amcam.AMCAM_EVENT_STILLIMAGE:
-                try:
-                    ctx.hcam.PullStillImageV2(buf, 24, None)
-                except amcam.HRESULTException:
-                    pass
-                finally:
-                    ev.set()
-
-        # temporary callback
-        self.hcam.StartPullModeWithCallback(cb, self)
-        self.hcam.Snap(0)
-        ev.wait(timeout=2.0)
-
-        # restore streaming callback
-        self.hcam.Stop()
-        self.hcam.StartPullModeWithCallback(self._sdk_cb, self)
-
-        img = Image.frombuffer(
-            "RGB", (self.w, self.h), buf, "raw",
-            "BGR" if self.hcam.get_Option(amcam.AMCAM_OPTION_BYTEORDER) else "RGB",
-            0, 1
-        )
-        out = io.BytesIO()
-        img.save(out, format="PNG")
-        return out.getvalue()
-
     # ——— simple setters / getters —————————————————————————
     def set_gain(self, gain: int):
         self.hcam.put_ExpoAGain(gain)
@@ -170,18 +123,37 @@ class CameraController:
         self.hcam.put_AutoExpoEnable(enabled)
 
     def set_resolution(self, mode: str):
-        idx = {"high": 0, "mid": 1, "low": 2}.get(mode.lower())
-        if idx is None:
-            raise ValueError("mode must be high|mid|low")
+        # ----------------- map mode → index -----------------
+        res_cnt = self.hcam.ResolutionNumber()              # how many entries?
+        sizes = [self.hcam.get_Resolution(i) for i in range(res_cnt)]  # [(w,h), …]
+
+        if mode.lower() == "high":
+            idx = max(range(res_cnt), key=lambda i: sizes[i][0]*sizes[i][1])
+        elif mode.lower() == "low":
+            idx = min(range(res_cnt), key=lambda i: sizes[i][0]*sizes[i][1])
+        elif mode.lower() == "mid" and res_cnt > 2:
+            idx = sorted(range(res_cnt), key=lambda i: sizes[i][0]*sizes[i][1])[res_cnt//2]
+        else:
+            raise ValueError(f"{mode!r} not available; camera has {res_cnt} mode(s)")
+
+        # ----------------- state change sequence ------------ 
+        self.hcam.Stop()
+        time.sleep(0.2)                                     # give firmware time
+
         self.hcam.put_eSize(idx)
         self.w, self.h = self.hcam.get_Size()
+
+        self.stride = ((self.w * 24 + 31) // 32) * 4
+        self.buf = ctypes.create_string_buffer(self.stride * self.h)
+
+        self.hcam.StartPullModeWithCallback(self._sdk_cb, self)
 
     def status(self) -> dict:
         return {
             "width": self.w,
             "height": self.h,
             "gain": self.hcam.get_ExpoAGain(),
-            "exposure_us": self.hcam.get_ExpoTime()[0],
+            "exposure_us": self.hcam.get_ExpoTime(),
             "auto_exposure": bool(self.hcam.get_AutoExpoEnable()),
             "fps": round(self.fps, 1),
         }
@@ -247,14 +219,21 @@ def status():
 @app.post("/gain")
 def set_gain(req: GainRequest):
     cam = ensure_cam()
+    cam.set_auto_exp(False)
     cam.set_gain(req.gain)
     return {"gain": req.gain}
 
 @app.post("/exposure")
 def set_exposure(req: ExposureRequest):
     cam = ensure_cam()
+    lo, hi, _ = cam.hcam.get_ExpTimeRange()
+    if not lo <= req.us <= hi:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Valid exposure range is {lo}–{hi} µs")
+    cam.set_auto_exp(False)
     cam.set_exposure(req.us)
-    return {"exposure_us": req.us}
+    return {"exposure_us": req.us, "auto_exposure": False}
 
 @app.post("/auto_exposure")
 def set_auto_exp(req: AutoExpRequest):
@@ -273,13 +252,21 @@ def set_resolution(req: ResolutionRequest):
 
 @app.get("/frame", response_class=Response, responses={200: {"content": {"image/png": {}}}})
 def frame():
-    png = ensure_cam().latest_png()
-    return Response(content=png, media_type="image/png")
-
-@app.get("/snapshot", response_class=Response, responses={200: {"content": {"image/png": {}}}})
-def snapshot():
-    png = ensure_cam().snapshot_png()
-    return Response(content=png, media_type="image/png")
+    cam = ensure_cam()
+    with cam._raw_lock:
+        raw = cam._latest_raw
+    if raw is None:
+        raise HTTPException(503, "No frame yet")
+    img = Image.frombuffer(
+        "RGB", (cam.w, cam.h), raw, "raw",
+        "BGR" if cam.hcam.get_Option(amcam.AMCAM_OPTION_BYTEORDER) else "RGB",
+        0, 1
+    )
+    bio = io.BytesIO()
+    img.save(bio, format="PNG")
+    return Response(content=bio.getvalue(),
+                    media_type="image/png",
+                    headers={"Cache-Control": "no-store"})
 
 # GUI discovery / health-check
 @app.get("/ping")
