@@ -1,0 +1,12 @@
+services:
+  backend:
+    build: ./Controller+fastapi
+    #container: blah this line actually can break some build stuff if 2 have the same container name, I just decided it to let it go auto instead
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - "8001:8001"
+    devices:
+      - "/dev:/dev"
+    environment:
+      - TZ=America/New_York

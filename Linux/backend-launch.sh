@@ -7,12 +7,12 @@
 #
 
 ################### configuration ########################################
-compose_relative="../Code/TDC001-project/docker-compose.backend.yml"
-service="tdc_backend" # docker-compose service name
-port=8000             # FastAPI external port
+compose_relative="../Code/Project/docker-compose.backend.yml"
+service="backend" # docker-compose service name
+port=8001             # FastAPI external port
 ##########################################################################
 
-echo -e "\n\e[36m──────── Thorlabs TDC001 BACKEND launcher ────────\e[0m\n"
+echo -e "\n\e[36m──────── BACKEND launcher ────────\e[0m\n"
 
 # 1) locate compose file -------------------------------------------------
 script_dir="$(cd -- "$(dirname "$0")" && pwd)"
