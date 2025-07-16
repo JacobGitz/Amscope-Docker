@@ -43,10 +43,18 @@ app = FastAPI(title="AmScope Camera API", version="0.1.0")
 # Global singleton (one camera per backend container)
 camera: "CameraController | None" = None
 
-# Small helper so callback prints don’t interleave
-_log_lock = threading.Lock()
+#a threading lock is useful so that one thread accesses a resource at a time
+#for example, multiple cameras streaming to the same memory location
+#if two cameras write to the same block of memory at the same time, the frame will be corrupted and destroyed
+#so, a lock ensures one camera uses the memory location, and then hands it to the next camera (or thread)
+#idk why this exact lock was placed here? 
 
+_log_lock = threading.Lock()
 # ──────────────────────────── Pydantic models ─────────────────────────
+
+#these just set default types for the types of input you can put into the fastapi boxes. 
+#a way of typesetting any of our endpoints effectively, and recognized by fastapi 
+
 class ConnectRequest(BaseModel):
     index: int = 0                        # Which camera to open
 
@@ -79,8 +87,13 @@ class CameraController:
         self.hcam.put_eSize(2)
         self.w, self.h = self.hcam.get_Size()
 
-        # Thread-safe storage for the latest raw RGB frame
+        # Thread-safe storage for the latest raw RGB frame, threading.lock was covered around line 46 in the comments
         self._raw_lock = threading.Lock()
+
+        #this is NOT a typeset, actually a bit confusing
+        #this is a useful way of telling someone what possible values a variable *should* hold
+        #note I say *should*, python doesn't stop you from putting a string in this for example
+        #this just states that this variable *should* contain bytes or nothing at all usually.
         self._latest_raw: bytes | None = None
 
         # Stats for FPS calculation
@@ -104,7 +117,7 @@ class CameraController:
         if event != amcam.AMCAM_EVENT_IMAGE:
             return  # Ignore non-image events for now
 
-        # Pull raw RGB24 into ctx.buf
+        # Pull raw RGB24 into ctx.buf, which is actually the CameraController buffer we created around line 104
         try:
             ctx.hcam.PullImageV2(ctx.buf, 24, None)
         except amcam.HRESULTException:
@@ -112,6 +125,9 @@ class CameraController:
             return
 
         # Copy the buffer to bytes so FastAPI threads can use it safely
+        # This entire method runs in its own thread when called by StartPullModeWithCallback around line 108
+        # We don't want the same camera to be writing 2 frames to this buffer at the same time, so we lock down the thread until it completes
+        # This prevents any other frames from being written to this buffer until one complete frame is done, then another thread can line up 
         with ctx._raw_lock:
             ctx._latest_raw = bytes(ctx.buf)
 
@@ -156,19 +172,25 @@ class CameraController:
         else:
             raise ValueError(f"{mode!r} not available; camera has {res_cnt} mode(s)")
 
+
+        #these important few lines stop most issues if the camera is being dumb and breaks when changing resolution
+        #if you realize the image isn't updating after you change a parameter, this is probably why
+        #seems like the threads break when you try to change the resolution while streaming
+        #this isn't ideal it seems lol 
+        #this also happens in many other state changes, and is critical to fixing a few bugs I have had with this
+
         # --- state change sequence ------------------------------------
-        self.hcam.Stop()
-        time.sleep(0.2)                       # allow firmware to settle
 
-        self.hcam.put_eSize(idx)
-        self.w, self.h = self.hcam.get_Size()
+        self.hcam.Stop()    #the pull mode with callback around line 109 seems to be stopped by this function, basically stop streaming
+        time.sleep(0.2)        # allow firmware to settle
 
-        # Re-allocate buffer for new frame size
-        self.stride = ((self.w * 24 + 31) // 32) * 4
-        self.buf = ctypes.create_string_buffer(self.stride * self.h)
+        self.hcam.put_eSize(idx) # set the new resolution mode 
+        self.w, self.h = self.hcam.get_Size() #get back the resolution in pixels
 
-        # Restart streaming with the same callback
-        self.hcam.StartPullModeWithCallback(self._sdk_cb, self)
+        self.stride = ((self.w * 24 + 31) // 32) * 4 #set our buffer up
+        self.buf = ctypes.create_string_buffer(self.stride * self.h) #create a buffer in memory with those dimensions
+
+        self.hcam.StartPullModeWithCallback(self._sdk_cb, self) #start streaming again
 
     def status(self) -> dict:
         """Return a dict used by GET /status"""
@@ -212,7 +234,6 @@ def _startup() -> None:
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
-    """Release USB resources on container exit (Ctrl-C / docker stop)."""
     if camera:
         camera.close()
 
@@ -295,23 +316,43 @@ def frame():
     Heavy PNG encoding happens *here* (FastAPI thread),
     not in the SDK callback, so streaming stays smooth.
     """
+
+    #make sure the camera is connected
     cam = ensure_cam()
+
+    #assuming we have our camera thread currently streaming raw images in the background to memory
     with cam._raw_lock:
+        #we go and set our raw variable to the latest raw image in the threat
         raw = cam._latest_raw
+
+    #if there is no image in the thread, we just return an error
     if raw is None:
         raise HTTPException(503, "No frame yet")
 
+    #Using pillow, this says we want an RGB image object, 
+    # with the output width and height we give it
+    # made from our raw bites as input
+    # state the input type is raw
+    # figure out our bytes are in BGR or RGB based on camera option, 
+    # and then lastly setting rows and orientation settings 
     img = Image.frombuffer(
-        "RGB",
-        (cam.w, cam.h),
+        "RGB", 
+        (cam.w, cam.h), 
         raw,
         "raw",
         "BGR" if cam.hcam.get_Option(amcam.AMCAM_OPTION_BYTEORDER) else "RGB",
         0,
         1,
     )
+
+    #save then this pillow image to a bytes.io file, which is a temporary "file" in RAM
+    #this allows us to store temporary things without hard disk writes 
     bio = io.BytesIO()
     img.save(bio, format="PNG")
+
+    #now we return the contents of our temporary ram file to our fastapi endpoint
+    # I guess tell the browser not to store this in its cache as well, so it doesn't overload 
+    # also set the return type, which is obviously PNG
     return Response(
         content=bio.getvalue(),
         media_type="image/png",
