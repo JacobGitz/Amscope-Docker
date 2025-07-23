@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 """
 launch.py  –  build/(re)start containers from a chosen Docker-Compose file
 ▶  Lists compose files under this repo (recursive)
@@ -6,7 +6,7 @@ launch.py  –  build/(re)start containers from a chosen Docker-Compose file
 ▶  Starts backend first, waits for it, then starts frontend
 ▶  Opens the first exposed host port of each launched service in the default browser
 """
-import subprocess, sys, socket, time, webbrowser, os, re
+import subprocess, sys, socket, time, webbrowser, re
 from pathlib import Path
 
 # ───────────────── helpers ────────────────────────────────────────────────────
@@ -32,19 +32,27 @@ def choose_from_list(items: list[Path], prompt: str) -> Path:
     if not items:
         die("No Docker-Compose files found.")
     print(prompt)
-    compose_dir = Path(__file__).resolve().parent.parent / "Code" / "Project"
+    
+    # Set the common root directory (root of the project)
+    common_root = Path(__file__).resolve().parent.parent
+    
     for i, p in enumerate(items, 1):
         try:
-            rel = p.relative_to(compose_dir)
+            # Make paths relative to the project root directory
+            rel = p.relative_to(common_root)
         except ValueError:
+            # Fallback: use the filename if relative path computation fails
             rel = p.name
         print(f" {i:2d}) {rel}")
+    
     try:
         idx = int(input("> ")) - 1
     except ValueError:
         die("Invalid selection.")
+    
     if idx not in range(len(items)):
         die("Choice out of range.")
+    
     return items[idx]
 
 def load_yaml(path: Path):
@@ -56,11 +64,9 @@ def load_yaml(path: Path):
         return yaml.safe_load(f)
 
 def host_ports(service_dict: dict) -> list[int]:
-    """Return list of host-side ports for service (int)."""
     ports = service_dict.get("ports", [])
     out = []
     for entry in ports:
-        # entry can be "8080:80", "127.0.0.1:3000:3000", or just "80"
         if isinstance(entry, int):
             out.append(entry)
         elif isinstance(entry, str):
@@ -72,23 +78,24 @@ def host_ports(service_dict: dict) -> list[int]:
 def image_exists(image: str) -> bool:
     return bool(run(["docker", "images", "-q", image], capture=True).stdout.strip())
 
-def wait_port(port: int, timeout: int = 60):
+def wait_ping(port: int, path="/ping", timeout: int = 15) -> bool:
+    import urllib.request
+    url = f"http://localhost:{port}{path}"
     start = time.time()
     while time.time() - start < timeout:
-        with socket.socket() as s:
-            s.settimeout(1)
-            try:
-                s.connect(("127.0.0.1", port))
-                return True
-            except (socket.timeout, ConnectionRefusedError):
-                time.sleep(0.5)
+        try:
+            with urllib.request.urlopen(url, timeout=2) as r:
+                if r.status == 200:
+                    return True
+        except:
+            pass
+        time.sleep(0.5)
     return False
 
 # ───────────────── main ──────────────────────────────────────────────────────
 def main():
-# Point directly to where your compose files live
     compose_dir = Path(__file__).resolve().parent.parent / "Code" / "Project"
-    compose_files = find_compose_files(compose_dir)    
+    compose_files = find_compose_files(compose_dir)
     chosen = choose_from_list(compose_files, "Select a compose file to launch:")
     data = load_yaml(chosen)
     services = data.get("services", {})
@@ -99,7 +106,7 @@ def main():
     frontend_name = None
     if len(services) == 2:
         names = list(services)
-        backend_name, frontend_name = names  # assume order
+        backend_name, frontend_name = names
     else:
         print("Detected services:")
         for i, name in enumerate(services, 1):
@@ -110,55 +117,47 @@ def main():
         frontend_name = list(services)[f_idx-1] if f_idx else None
 
     docker_ok()
-
-    # ───── backend first ─────
     up_order = []
-    if backend_name:
-        img = services[backend_name].get("image", backend_name)
-        rebuild = False
+
+    for role, name in (("backend", backend_name), ("frontend", frontend_name)):
+        if not name:
+            continue
+        img = services[name].get("image", name)
         if image_exists(img):
-            rebuild = input(f"Rebuild existing image '{img}'? (y/N) ").lower() == "y"
-        cmd = ["docker", "compose", "-f", str(chosen), "up", "-d"]
-        if rebuild:
-            cmd.append("--build")
-        cmd.append(backend_name)
-        if run(cmd).returncode != 0:
-            die("Docker compose failed starting backend.")
-        up_order.append((backend_name, services[backend_name]))
-
-        # wait for first port
-        ports = host_ports(services[backend_name])
-        if ports and wait_port(ports[0], 60):
-            print(f"[OK] Backend listening on port {ports[0]}")
+            print(f"[INFO] Found existing image for {role} ({img})")
+            rebuild = input(f"Rebuild {role}? [y/N] ").strip().lower().startswith("y")
         else:
-            print("[WARN] Backend port not ready after 60 s.")
+            print(f"[INFO] No existing image for {role} – will build.")
+            rebuild = True
 
-    # ───── frontend ─────
-    if frontend_name:
-        img = services[frontend_name].get("image", frontend_name)
-        if image_exists(img):
-            rebuild = input(f"Rebuild existing image '{img}'? (y/N) ").lower() == "y"
-        else:
-            rebuild = False
-        cmd = ["docker", "compose", "-f", str(chosen), "up", "-d"]
         if rebuild:
-            cmd.append("--build")
-        cmd.append(frontend_name)
-        if run(cmd).returncode != 0:
-            die("Docker compose failed starting frontend.")
-        up_order.append((frontend_name, services[frontend_name]))
+            print(f"[INFO] Building image for {role}...")
+            if run(["docker", "compose", "-f", str(chosen), "build", "--pull", name]).returncode != 0:
+                die(f"Build failed for {role}.")
 
-    # ───── open browsers ─────
+        cmd = ["docker", "compose", "-f", str(chosen), "up", "-d", "--force-recreate", name]
+        if run(cmd).returncode != 0:
+            die(f"Docker compose failed starting {role}.")
+        up_order.append((name, services[name]))
+
+        ports = host_ports(services[name])
+        if role == "backend" and ports:
+            if wait_ping(ports[0]):
+                print(f"[OK] Backend at http://localhost:{ports[0]}/ping is ready")
+            else:
+                print("[WARN] Backend did not respond to /ping within timeout.")
+
     for name, svc in up_order:
         ports = host_ports(svc)
         if ports:
-             url = f"http://localhost:{ports[0]}"
-             if name == backend_name:
-                 url += "/docs"
-             webbrowser.open(url)
-             print(f"[INFO] Opened {url}")
+            url = f"http://localhost:{ports[0]}"
+            if name == backend_name:
+                url += "/docs"
+            webbrowser.open(url)
+            print(f"[INFO] Opened {url}")
 
     print("\n[ALL DONE] Containers running.\n")
 
 if __name__ == "__main__":
     main()
+
