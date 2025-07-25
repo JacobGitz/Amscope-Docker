@@ -3,12 +3,30 @@
 setup_docker.py – Modify Docker Compose configuration
 ▶  Lists compose files under this repo (recursive)
 ▶  Allows modification of image name, tag, and port
+▶  Enumerates USB devices, and binds to a selected camera for Docker container
 """
 import yaml
 import subprocess
 import sys
 import re
+import json
+import os
 from pathlib import Path
+from typing import List, Dict, Any, Optional
+
+try:
+    import amcam
+except ImportError as exc:
+    raise SystemExit(
+        "The amcam SDK package is required. Please install it before running setup."
+    ) from exc
+
+try:
+    import usb.core  # type: ignore
+    import usb.util  # type: ignore
+except Exception:
+    usb = None  # sentinel; pyusb not installed or not functional
+
 
 # ───────────────── helpers ────────────────────────────────────────────────────
 def die(msg: str, code: int = 1):
@@ -84,6 +102,63 @@ def edit_docker_compose(compose_file, new_image_name, new_port, new_tag):
 
     print(f"Updated {compose_file} with image name: {new_image_name}, tag: {new_tag}, and port: {new_port}")
 
+
+def list_cameras() -> List[Dict[str, Any]]:
+    """Enumerate connected cameras via the AmScope SDK."""
+    devices: List[Dict[str, Any]] = []
+    cams = amcam.Amcam.EnumV2()
+    for idx, dev in enumerate(cams):
+        serial: Optional[str] = None
+        vid: Optional[str] = None
+        pid: Optional[str] = None
+        h = None
+        try:
+            h = amcam.Amcam.Open(dev.id)
+            if h:
+                try:
+                    serial = h.SerialNumber()
+                except Exception:
+                    serial = None
+                # Try resolving VID/PID if pyusb is available
+                if serial:
+                    vid, pid = _get_usb_info_by_serial(serial)
+        except Exception:
+            pass
+        finally:
+            try:
+                if h:
+                    h.Close()
+            except Exception:
+                pass
+        devices.append({
+            "index": idx,
+            "id": dev.id,
+            "name": dev.displayname,
+            "serial_number": serial,
+            "vendor_id": vid,
+            "product_id": pid,
+        })
+    return devices
+
+
+def _get_usb_info_by_serial(serial: str) -> tuple[Optional[str], Optional[str]]:
+    """Attempt to find a USB device by its serial number."""
+    if serial and usb:
+        try:
+            for dev in usb.core.find(find_all=True):
+                try:
+                    dev_serial = usb.util.get_string(dev, dev.iSerialNumber) if dev.iSerialNumber else None
+                except Exception:
+                    dev_serial = None
+                if dev_serial and dev_serial.strip() == serial:
+                    vid = f"0x{dev.idVendor:04x}"
+                    pid = f"0x{dev.idProduct:04x}"
+                    return vid, pid
+        except Exception:
+            pass
+    return None, None
+
+
 # ───────────────── main ──────────────────────────────────────────────────────
 def main():
     # Search for docker-compose files in the current directory and subdirectories
@@ -111,6 +186,33 @@ def main():
         cmd = ["docker", "compose", "-f", str(chosen), "build", "--pull", "backend"]
         if run(cmd).returncode != 0:
             die("Build failed.")
+
+    # List available cameras and prompt for selection
+    devices = list_cameras()
+    if not devices:
+        print("No cameras found. Exiting.")
+        return
+    for d in devices:
+        print(f"{d['index']}: {d['name']} (Serial: {d['serial_number']})")
+    selected_idx = input(f"Select camera [0]: ") or "0"
+    selected_camera = devices[int(selected_idx)]
+
+    # Save configuration for the selected camera
+    config = {
+        "device_id": selected_camera["id"],
+        "device_name": selected_camera["name"],
+        "serial_number": selected_camera.get("serial_number"),
+        "vendor_id": selected_camera.get("vendor_id"),
+        "product_id": selected_camera.get("product_id"),
+    }
+    config_path = Path(os.getenv("DEVICE_CONFIG", "device_config.json"))
+    try:
+        with config_path.open("w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+        print(f"Saved configuration to {config_path}")
+    except Exception as e:
+        print(f"Failed to save configuration: {e}")
+
 
 if __name__ == "__main__":
     main()
