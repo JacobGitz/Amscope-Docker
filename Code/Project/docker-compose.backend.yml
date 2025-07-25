@@ -5,8 +5,8 @@ services:
     - /dev:/dev
     environment:
     - TZ=America/New_York
-    image: amscope-camera:camera1
+    image: amscope-camera-backend:camera-1
     ports:
-    - 80:8001
+    - 8007:8000
     privileged: true
     restart: unless-stopped

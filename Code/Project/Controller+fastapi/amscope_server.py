@@ -238,12 +238,12 @@ def _shutdown() -> None:
         camera.close()
 
 # ───────────────────────── API routes ─────────────────────────────────
-@app.get("/cameras")
+@app.get("/get_cameras")
 def cameras():
     """List all detected cameras (even if one is already open)."""
     return list_cameras()
 
-@app.post("/connect")
+@app.post("/set_connected")
 def connect(req: ConnectRequest):
     """Open the selected camera index and close any previous one."""
     cams = amcam.Amcam.EnumV2()
@@ -255,7 +255,7 @@ def connect(req: ConnectRequest):
     camera = CameraController(amcam.Amcam.Open(cams[req.index].id))
     return {"status": "connected", "name": cams[req.index].displayname}
 
-@app.post("/disconnect")
+@app.post("/set_disconnected")
 def disconnect():
     """Close the active camera handle."""
     global camera
@@ -264,12 +264,12 @@ def disconnect():
         camera = None
     return {"status": "disconnected"}
 
-@app.get("/status")
+@app.get("/get_status")
 def status():
     """Return width/height, gain, exposure, AE flag, FPS."""
     return ensure_cam().status()
 
-@app.post("/gain")
+@app.post("/set_gain")
 def set_gain(req: GainRequest):
     """Force manual mode then set electronic gain (%)."""
     cam = ensure_cam()
@@ -277,7 +277,7 @@ def set_gain(req: GainRequest):
     cam.set_gain(req.gain)
     return {"gain": req.gain}
 
-@app.post("/exposure")
+@app.post("/get_exposure")
 def set_exposure(req: ExposureRequest):
     """Validate range, disable AE, then set exposure time (µs)."""
     cam = ensure_cam()
@@ -295,7 +295,7 @@ def set_auto_exp(req: AutoExpRequest):
     cam.set_auto_exp(req.enabled)
     return {"auto_exposure": req.enabled}
 
-@app.post("/resolution")
+@app.post("/set_resolution")
 def set_resolution(req: ResolutionRequest):
     """Switch to \"high\", \"mid\" or \"low\" pre-defined sensor size."""
     cam = ensure_cam()
@@ -306,7 +306,7 @@ def set_resolution(req: ResolutionRequest):
     return {"resolution": req.mode}
 
 @app.get(
-    "/frame",
+    "/get_frame",
     response_class=Response,
     responses={200: {"content": {"image/png": {}}}},
 )
@@ -359,7 +359,7 @@ def frame():
         headers={"Cache-Control": "no-store"},
     )
 
-@app.get("/ping")
+@app.get("/get_ping")
 def ping():
     """Tiny endpoint so a GUI can test connectivity."""
     return {"backend": "AmScope"}

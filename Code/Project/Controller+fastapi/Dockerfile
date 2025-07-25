@@ -29,7 +29,7 @@ RUN if [ "$PIP_NO_INDEX" = "1" ]; then \
     fi
 
 # ───────── runtime params ────
-EXPOSE 8001/tcp
+EXPOSE 8000/tcp
 ENV PYTHONUNBUFFERED=1
 
 ENTRYPOINT ["./entrypoint.sh"]

@@ -76,7 +76,7 @@ def edit_docker_compose(compose_file, new_image_name, new_port, new_tag):
 
     # Update the ports exposed by the backend
     if 'ports' in backend_service:
-        backend_service['ports'] = [f"80:{new_port}"]
+        backend_service['ports'] = [f"{new_port}:8000"]
 
     # Save the modified docker-compose.yml
     with open(compose_file, 'w') as f:
@@ -92,8 +92,8 @@ def main():
     chosen = choose_from_list(compose_files, "Select a compose file to modify:")
 
     # Get user input for new image name, tag, and port
-    new_image_name = input("Enter the new Docker image name (e.g., backend): ")
-    new_tag = input("Enter the new tag (e.g., v1.0): ")
+    new_image_name = input("Enter the new Docker image name (e.g., amscope-camera-backend): ")
+    new_tag = input("Enter the new tag (camera-1): ")
     new_port = input("Enter the new exposed port (e.g., 8000): ")
 
     # Validate input
