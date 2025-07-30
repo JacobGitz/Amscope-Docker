@@ -368,7 +368,7 @@ def frame():
     )
 
 
-@app.get("/ping")
+@app.get("/get_ping")
 def ping():
     """
     Health check for the backend.
@@ -391,8 +391,20 @@ def ping():
         cams = amcam.Amcam.EnumV2()
         found = False
         for dev in cams:
+            #printouts for debugging purposes
+            #the returned device id varies by one number by plugging and replugging the camera for some reason, we will remove this single number to perform the conditional
+            #print("assigned id:" + assigned_device_id)
+            #print(dev.id)
             try:
-                if dev.id == assigned_device_id:
+                dev_id_parts = dev.id.split('-')
+                assigned_id_parts = assigned_device_id.split('-')
+                del assigned_id_parts[2]      
+                del dev_id_parts[2]
+                new_dev_id = '-'.join(dev_id_parts)
+                new_assigned_id = '-'.join(assigned_id_parts)
+                print(new_dev_id)
+                print(new_assigned_id)
+                if new_dev_id == new_assigned_id:
                     found = True
                     break
             except Exception:
