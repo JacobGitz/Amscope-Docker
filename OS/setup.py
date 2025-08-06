@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """
-setup_docker.py – Modify Docker Compose configuration
-▶  Lists compose files under this repo (recursive)
-▶  Allows modification of image name, tag, and port
-▶  Enumerates USB devices, and binds to a selected camera for Docker container
+setup_docker.py – Add a new camera service to a Docker-Compose stack
+
+• Recursively lists compose files.
+• Appends a camN service with its own host port.
+• Enumerates AmScope cameras; writes device_config.json
+  into Code/Project/Controller+fastapi/ (same dir as Dockerfile).
+• Optionally builds the new service image.
+
+Repo layout assumed:
+  Amscope-Docker/
+  ├── Code/Project/Controller+fastapi/
+  │      ├── Dockerfile
+  │      └── amscope_server.py
+  └── OS/
+         └── setup_docker.py   ← this file
 """
-import yaml
-import subprocess
-import sys
-import re
-import json
-import os
+
+from __future__ import annotations
+
+import os, re, sys, json, yaml, socket, subprocess, shutil
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
+# ───────────────────────────────────────── AmScope / USB ─────────
 try:
     import amcam
 except ImportError as exc:
@@ -25,92 +35,104 @@ try:
     import usb.core  # type: ignore
     import usb.util  # type: ignore
 except Exception:
-    usb = None  # sentinel; pyusb not installed or not functional
+    usb = None  # sentinel if pyusb missing
 
-
-# ───────────────── helpers ────────────────────────────────────────────────────
+# ───────────────────────────────────────── helpers ───────────────
 def die(msg: str, code: int = 1):
     print(f"[ERROR] {msg}")
     sys.exit(code)
 
-def run(cmd: list[str], capture=False) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, text=True, capture_output=capture, check=False)
+def run(cmd: list[str]) -> None:
+    res = subprocess.run(cmd, text=True)
+    if res.returncode:
+        die(f"Command failed: {' '.join(cmd)}")
 
 def find_compose_files(root: Path):
-    patterns = ("docker-compose*.yml", "docker-compose*.yaml", "compose*.yml", "compose*.yaml")
-    files = []
-    for pat in patterns:
-        files.extend(root.rglob(pat))
-    return sorted(set(files))
+    pats = ("docker-compose*.yml", "docker-compose*.yaml",
+            "compose*.yml", "compose*.yaml")
+    out: list[Path] = []
+    for pat in pats:
+        out.extend(root.rglob(pat))
+    return sorted(set(out))
 
 def choose_from_list(items: list[Path], prompt: str) -> Path:
-    if not items:
-        die("No Docker-Compose files found.")
     print(prompt)
-    
-    # Set the common root directory (root of the project)
-    common_root = Path(__file__).resolve().parent.parent  # This should resolve to the project root
-    
+    common_root = repo_root
     for i, p in enumerate(items, 1):
         try:
-            # Make paths relative to the project root directory (common_root)
             rel = p.relative_to(common_root)
         except ValueError:
-            # Fallback: use the filename if relative path computation fails
             rel = p.name
         print(f" {i:2d}) {rel}")
-    
     try:
         idx = int(input("> ")) - 1
     except ValueError:
         die("Invalid selection.")
-    
     if idx not in range(len(items)):
         die("Choice out of range.")
-    
     return items[idx]
 
-def load_yaml(path: Path):
-    try:
-        import yaml
-    except ModuleNotFoundError:
-        die("pyyaml not installed.  `pip install pyyaml`.")
-    with path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+# ─────────────────────────────────── compose-edit helpers ────────
+def pick_free_port(start: int = 8001, end: int = 8999) -> int:
+    """Return first TCP port in range that isn't in use."""
+    def busy(p: int) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            return s.connect_ex(("127.0.0.1", p)) == 0
+    for p in range(start, end + 1):
+        if not busy(p):
+            return p
+    raise RuntimeError("No free port in range")
 
-def edit_docker_compose(compose_file, new_image_name, new_port, new_tag):
-    with open(compose_file, 'r') as f:
-        # Load the existing docker-compose.yml
-        compose_data = yaml.safe_load(f)
+def next_service_name(svcs: dict, base: str = "cam") -> str:
+    nums = {int(m.group(1)) for s in svcs
+            if (m := re.fullmatch(fr"{base}(\d+)", s))}
+    n = 1
+    while n in nums:
+        n += 1
+    return f"{base}{n}"
 
-    # Modify the backend image, port, and tag
-    services = compose_data.get('services', {})
+def append_camera_service(
+    compose_path: Path,
+    image_name: str,
+    tag: str,
+    internal_port: int,
+    host_port: int | None,
+) -> tuple[str, int]:
+    with compose_path.open("r", encoding="utf-8") as f:
+        compose = yaml.safe_load(f) or {}
+    svcs = compose.setdefault("services", {})
+    svc = next_service_name(svcs)
+    host_port = host_port or pick_free_port()
 
-    # Assume we are modifying the 'backend' service; this can be extended for multiple services
-    backend_service = services.get('backend', {})
+    svcs[svc] = {
+        "image": f"{image_name}:{tag}",
+        "container_name": svc,
+        "environment": {"PORT": str(internal_port)},
+        "ports": [f"{host_port}:{internal_port}"],
+    }
 
-    # Modify image name and tag
-    backend_service['image'] = f"{new_image_name}:{new_tag}"
+    with compose_path.open("w", encoding="utf-8") as f:
+        yaml.dump(compose, f, default_flow_style=False)
 
-    # Update the ports exposed by the backend
-    if 'ports' in backend_service:
-        backend_service['ports'] = [f"{new_port}:8000"]
+    print(f"✓ Added {svc}  →  host:{host_port}  ({image_name}:{tag})")
+    return svc, host_port
 
-    # Save the modified docker-compose.yml
-    with open(compose_file, 'w') as f:
-        yaml.dump(compose_data, f, default_flow_style=False)
-
-    print(f"Updated {compose_file} with image name: {new_image_name}, tag: {new_tag}, and port: {new_port}")
-
+# ─────────────────────────────────── camera discovery ────────────
+def _usb_info(serial: str) -> tuple[Optional[str], Optional[str]]:
+    if serial and usb:
+        for dev in usb.core.find(find_all=True):
+            try:
+                s = usb.util.get_string(dev, dev.iSerialNumber) if dev.iSerialNumber else None
+            except Exception:
+                s = None
+            if s and s.strip() == serial:
+                return f"0x{dev.idVendor:04x}", f"0x{dev.idProduct:04x}"
+    return None, None
 
 def list_cameras() -> List[Dict[str, Any]]:
-    """Enumerate connected cameras via the AmScope SDK."""
-    devices: List[Dict[str, Any]] = []
-    cams = amcam.Amcam.EnumV2()
-    for idx, dev in enumerate(cams):
-        serial: Optional[str] = None
-        vid: Optional[str] = None
-        pid: Optional[str] = None
+    out: List[Dict[str, Any]] = []
+    for idx, dev in enumerate(amcam.Amcam.EnumV2()):
+        serial = vid = pid = None
         h = None
         try:
             h = amcam.Amcam.Open(dev.id)
@@ -118,10 +140,9 @@ def list_cameras() -> List[Dict[str, Any]]:
                 try:
                     serial = h.SerialNumber()
                 except Exception:
-                    serial = None
-                # Try resolving VID/PID if pyusb is available
+                    pass
                 if serial:
-                    vid, pid = _get_usb_info_by_serial(serial)
+                    vid, pid = _usb_info(serial)
         except Exception:
             pass
         finally:
@@ -130,89 +151,70 @@ def list_cameras() -> List[Dict[str, Any]]:
                     h.Close()
             except Exception:
                 pass
-        devices.append({
+        out.append({
             "index": idx,
             "id": dev.id,
             "name": dev.displayname,
-            "serial_number": serial,
-            "vendor_id": vid,
-            "product_id": pid,
+            "serial": serial,
+            "vid": vid,
+            "pid": pid,
         })
-    return devices
+    return out
 
+# ────────────────────────────────────────── main ────────────────
+repo_root = Path(__file__).resolve().parents[1]          # Amscope-Docker/
+controller_dir = repo_root / "Code/Project/Controller+fastapi"
+internal_port = 8000
 
-def _get_usb_info_by_serial(serial: str) -> tuple[Optional[str], Optional[str]]:
-    """Attempt to find a USB device by its serial number."""
-    if serial and usb:
-        try:
-            for dev in usb.core.find(find_all=True):
-                try:
-                    dev_serial = usb.util.get_string(dev, dev.iSerialNumber) if dev.iSerialNumber else None
-                except Exception:
-                    dev_serial = None
-                if dev_serial and dev_serial.strip() == serial:
-                    vid = f"0x{dev.idVendor:04x}"
-                    pid = f"0x{dev.idProduct:04x}"
-                    return vid, pid
-        except Exception:
-            pass
-    return None, None
-
-
-# ───────────────── main ──────────────────────────────────────────────────────
 def main():
-    # Search for docker-compose files in the current directory and subdirectories
-    compose_dir = Path(__file__).resolve().parent.parent / "Code" / "Project"
-    compose_files = find_compose_files(compose_dir)
-    chosen = choose_from_list(compose_files, "Select a compose file to modify:")
+    # 1) pick compose file
+    cmp_files = find_compose_files(repo_root)
+    cmp_path  = choose_from_list(cmp_files, "\nSelect a compose file:")
 
-    # Get user input for new image name, tag, and port
-    new_image_name = input("Enter the new Docker image name (e.g., amscope-camera-backend): ")
-    new_tag = input("Enter the new tag (camera-1): ")
-    new_port = input("Enter the new exposed port (e.g., 8000): ")
+    # 2) get image info
+    img = input("Docker image name [amscope-camera-backend]: ").strip() or "amscope-camera-backend"
+    tag = input("Unique tag for this camera [camera-1]: ").strip() or "camera-1"
+    hp  = input("Host port (blank ⇒ auto): ").strip()
+    host_port = int(hp) if hp else None
 
-    # Validate input
-    if not new_image_name or not new_tag or not new_port:
-        print("Invalid input, all fields are required.")
-        sys.exit(1)
+    # 3) select camera *before* building (so file is ready)
+    devs = list_cameras()
+    if not devs:
+        die("No cameras detected.")
+    for d in devs:
+        print(f" {d['index']}) {d['name']}  (Serial: {d['serial']})")
+    sel = int(input("Pick camera [0]: ") or "0")
+    cam = devs[sel]
 
-    # Edit the docker-compose.yml file
-    edit_docker_compose(chosen, new_image_name, new_port, new_tag)
-
-    # Optionally, rebuild the image if needed
-    rebuild = input("Do you want to rebuild the Docker image? [y/N] ").strip().lower().startswith("y")
-    if rebuild:
-        print(f"[INFO] Building image for {new_image_name}...")
-        cmd = ["docker", "compose", "-f", str(chosen), "build", "--pull", "backend"]
-        if run(cmd).returncode != 0:
-            die("Build failed.")
-
-    # List available cameras and prompt for selection
-    devices = list_cameras()
-    if not devices:
-        print("No cameras found. Exiting.")
-        return
-    for d in devices:
-        print(f"{d['index']}: {d['name']} (Serial: {d['serial_number']})")
-    selected_idx = input(f"Select camera [0]: ") or "0"
-    selected_camera = devices[int(selected_idx)]
-
-    # Save configuration for the selected camera
-    config = {
-        "device_id": selected_camera["id"],
-        "device_name": selected_camera["name"],
-        "serial_number": selected_camera.get("serial_number"),
-        "vendor_id": selected_camera.get("vendor_id"),
-        "product_id": selected_camera.get("product_id"),
+    # 4) write device_config.json into Controller+fastapi/
+    cfg_path = controller_dir / "device_config.json"
+    cfg = {
+        "device_id": cam["id"],
+        "device_name": cam["name"],
+        "serial_number": cam["serial"],
+        "vendor_id": cam["vid"],
+        "product_id": cam["pid"],
     }
-    config_path = Path(os.getenv("DEVICE_CONFIG", "device_config.json"))
-    try:
-        with config_path.open("w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
-        print(f"Saved configuration to {config_path}")
-    except Exception as e:
-        print(f"Failed to save configuration: {e}")
+    controller_dir.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps(cfg, indent=2))
+    print(f"📄  device_config.json → {cfg_path.relative_to(repo_root)}")
 
+    # 5) append service
+    svc, host_port = append_camera_service(
+        cmp_path, img, tag, internal_port, host_port
+    )
+
+    # 6) optionally build *after* config file exists in context
+    if input("Build the new service image now? [y/N] ").lower().startswith("y"):
+        print("[INFO] Building …")
+        run(["docker", "compose", "-f", str(cmp_path), "build", "--pull", svc])
+
+    # 7) final hint
+    rel_cmp = cmp_path.relative_to(repo_root)
+    print("\nNext step:")
+    print(f"  docker compose -f {rel_cmp} up -d {svc}")
+    print(f"  # API will be reachable at http://<host>:{host_port}/")
 
 if __name__ == "__main__":
     main()
+

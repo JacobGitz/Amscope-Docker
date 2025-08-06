@@ -7,6 +7,27 @@ services:
     - TZ=America/New_York
     image: amscope-camera-backend:camera-1
     ports:
-    - 8006:8000
+    - 8002:8000
     privileged: true
     restart: unless-stopped
+  cam1:
+    container_name: cam1
+    environment:
+      PORT: '8000'
+    image: amscope-camera-backend:camera-1
+    ports:
+    - 8005:8000
+  cam2:
+    container_name: cam2
+    environment:
+      PORT: '8000'
+    image: amscope-camera-backend:camera-1
+    ports:
+    - 8006:8000
+  cam3:
+    container_name: cam3
+    environment:
+      PORT: '8000'
+    image: amscope-camera-backend:camera-1
+    ports:
+    - 8006:8000

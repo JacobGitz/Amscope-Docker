@@ -266,7 +266,7 @@ def _startup() -> None:
             # object that ``amcam.Amcam.Open`` accepts directly.  We use
             # string comparison where possible but fall back to equality.
             try:
-                if dev.id == assigned_device_id:
+                if canonical_id(dev.id) == canonical_id(assigned_device_id):
                     camera = CameraController(amcam.Amcam.Open(dev.id))
                     break
             except Exception:
@@ -367,6 +367,19 @@ def frame():
         headers={"Cache-Control": "no-store"},
     )
 
+def canonical_id(dev_id: str) -> str:
+    """
+    Return the USB-ID with the volatile *third* token stripped.
+
+    Example
+    -------
+    'tp-1-7-1351-25360'   →  'tp-1-1351-25360'
+    'tp-1-13-1351-25360'  →  'tp-1-1351-25360'
+    """
+    parts = dev_id.split('-')
+    if len(parts) >= 5:
+        del parts[2]               # drop the port number
+    return '-'.join(parts)
 
 @app.get("/get_ping")
 def ping():
@@ -375,8 +388,10 @@ def ping():
 
     This endpoint reports whether the assigned camera (as configured by
     ``setup.py``) is physically attached to the system.  If the device
+
     configuration file has not been created the status is reported as
     ``not-configured``.
+
     """
     load_config()  # reload in case the config was updated while running
     status: str
@@ -396,23 +411,67 @@ def ping():
             #print("assigned id:" + assigned_device_id)
             #print(dev.id)
             try:
-                dev_id_parts = dev.id.split('-')
-                assigned_id_parts = assigned_device_id.split('-')
-                del assigned_id_parts[2]      
-                del dev_id_parts[2]
-                new_dev_id = '-'.join(dev_id_parts)
-                new_assigned_id = '-'.join(assigned_id_parts)
-                print(new_dev_id)
-                print(new_assigned_id)
-                if new_dev_id == new_assigned_id:
-                    found = True
-                    break
+                for dev in cams:
+                    dev_id_canon = canonical_id(dev.id)
+                    assigned_id_canon = canonical_id(assigned_device_id)
+                    if dev_id_canon == assigned_id_canon:
+                        found = True
+                        break
             except Exception:
                 pass
         status = "connected" if found else "not-connected"
         name = assigned_device_name
     return {"status": status, "name": name}
 
+from fastapi.responses import StreamingResponse
+
+import cv2
+import numpy as np
+
+@app.get("/get_stream")
+def stream():
+    """
+    MJPEG stream of the live camera feed.
+    Streamed as multipart/x-mixed-replace.
+    Compatible with most web browsers.
+    """
+    cam = ensure_cam()
+
+    def mjpeg_generator():
+        while True:
+            with cam._raw_lock:
+                raw = cam._latest_raw
+            if raw is None:
+                time.sleep(0.01)
+                continue
+            # Convert to RGB image
+            img = Image.frombuffer(
+                "RGB",
+                (cam.w, cam.h),
+                raw,
+                "raw",
+                "BGR" if cam.hcam.get_Option(amcam.AMCAM_OPTION_BYTEORDER) else "RGB",
+                0,
+                1,
+            )
+            # Convert to JPEG (in-memory)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=80)
+            frame = buf.getvalue()
+
+            # Yield in MJPEG format
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                b"Content-Length: " + f"{len(frame)}".encode() + b"\r\n\r\n" +
+                frame + b"\r\n"
+            )
+            time.sleep(0.01)  # ~100 FPS max
+
+    return StreamingResponse(
+        mjpeg_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
 
 # The following endpoints have intentionally been removed from the public
 # interface: ``/get_cameras``, ``/set_connected`` and ``/set_disconnected``.
