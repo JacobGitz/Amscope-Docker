@@ -34,7 +34,7 @@ import threading
 import time
 from typing import List, Optional
 
-# ── third‑party ───────────────────────────────────────────────────────
+# ── third-party ───────────────────────────────────────────────────────
 import amcam                              # Vendor SDK Python wrapper
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
@@ -59,7 +59,7 @@ assigned_device_name: Optional[str] = None
 # Global singleton (one camera per backend container)
 camera: "CameraController | None" = None
 
-app = FastAPI(title="AmScope Camera API", version="0.2.0")
+app = FastAPI(title="AmScope Camera API", version="0.2.1")
 
 
 def load_config() -> None:
@@ -93,7 +93,7 @@ class GainRequest(BaseModel):
 
 
 class ExposureRequest(BaseModel):
-    us: int  # micro‑seconds
+    us: int  # micro-seconds
 
 
 class AutoExpRequest(BaseModel):
@@ -116,11 +116,36 @@ class CameraController:
     def __init__(self, dev: amcam.Amcam) -> None:
         self.hcam = dev
 
-        # Default preview resolution (index 2 is usually 640×480)
-        self.hcam.put_eSize(2)
+        # ---------- SAFE DEFAULT PREVIEW SIZE ----------
+        # Some cameras expose fewer than 3 resolutions; hard-coding index 2
+        # can raise E_INVALIDARG (-2147024809). Choose a valid index:
+        # prefer "index 2" when it exists, else the highest available, else 0.
+        try:
+            res_cnt = int(self.hcam.ResolutionNumber())
+        except Exception:
+            res_cnt = 0
+
+        if res_cnt <= 0:
+            default_idx = 0
+        elif res_cnt > 2:
+            default_idx = 2
+        else:
+            default_idx = res_cnt - 1  # 1→0, 2→1
+
+        try:
+            self.hcam.put_eSize(default_idx)
+        except amcam.HRESULTException:
+            # Fallback to index 0 if the preferred index is invalid for this model
+            try:
+                self.hcam.put_eSize(0)
+            except Exception:
+                # As a last resort, continue with whatever size the camera boots with
+                pass
+        # ------------------------------------------------
+
         self.w, self.h = self.hcam.get_Size()
 
-        # Thread‑safe storage for the latest raw RGB frame
+        # Thread-safe storage for the latest raw RGB frame
         self._raw_lock = threading.Lock()
         self._latest_raw: bytes | None = None
 
@@ -130,7 +155,7 @@ class CameraController:
         self.fps = 0.0
 
         # Allocate one RGB888 buffer big enough for the chosen size
-        stride = ((self.w * 24 + 31) // 32) * 4         # 4‑byte aligned
+        stride = ((self.w * 24 + 31) // 32) * 4         # 4-byte aligned
         self.buf = ctypes.create_string_buffer(stride * self.h)
         self.stride = stride
 
@@ -143,7 +168,7 @@ class CameraController:
     @staticmethod
     def _sdk_cb(event: int, ctx: "CameraController"):
         if event != amcam.AMCAM_EVENT_IMAGE:
-            return  # Ignore non‑image events for now
+            return  # Ignore non-image events for now
         try:
             ctx.hcam.PullImageV2(ctx.buf, 24, None)
         except amcam.HRESULTException:
@@ -152,7 +177,7 @@ class CameraController:
         # Copy the buffer to bytes so FastAPI threads can use it safely
         with ctx._raw_lock:
             ctx._latest_raw = bytes(ctx.buf)
-        # --- Simple FPS meter (1‑second sliding window) ---------------
+        # --- Simple FPS meter (1-second sliding window) ---------------
         ctx._frame_count += 1
         now = time.perf_counter()
         if now - ctx._last_tick >= 1.0:
@@ -177,10 +202,12 @@ class CameraController:
         """
         Change sensor binning/ROI for "high", "mid", or "low".
 
-        Implements:  Stop → eSize → re‑alloc buffer → Start
+        Implements:  Stop → eSize → re-alloc buffer → Start
         """
         # --- translate mode → index -----------------------------------
         res_cnt = self.hcam.ResolutionNumber()
+        if res_cnt <= 0:
+            raise ValueError("No resolutions reported by camera")
         sizes = [self.hcam.get_Resolution(i) for i in range(res_cnt)]
 
         if mode.lower() == "high":
@@ -252,7 +279,7 @@ def _startup() -> None:
     another file specified by ``DEVICE_CONFIG``) and then searches for a
     matching device in the list returned by ``amcam.Amcam.EnumV2``.
     If a match is found a ``CameraController`` is created and stored in
-    the module‑level ``camera`` variable.  If no match is found the
+    the module-level ``camera`` variable.  If no match is found the
     server starts in a degraded state where control endpoints will
     return HTTP 503.
     """
@@ -273,7 +300,7 @@ def _startup() -> None:
                 # Some platforms may not support comparison of the id
                 # attribute – ignore and continue searching.
                 pass
-    # Fallback: If no configuration or match, do not auto‑connect.  A
+    # Fallback: If no configuration or match, do not auto-connect.  A
     # missing connection will cause API endpoints to return HTTP 503.
 
 
@@ -316,7 +343,7 @@ def set_exposure(req: ExposureRequest):
 
 @app.post("/auto_exposure")
 def set_auto_exp_endpoint(req: AutoExpRequest):
-    """Enable/disable auto‑exposure mode."""
+    """Enable/disable auto-exposure mode."""
     cam = ensure_cam()
     cam.set_auto_exp(req.enabled)
     return {"auto_exposure": req.enabled}
@@ -324,7 +351,7 @@ def set_auto_exp_endpoint(req: AutoExpRequest):
 
 @app.post("/set_resolution")
 def set_resolution_endpoint(req: ResolutionRequest):
-    """Switch to "high", "mid" or "low" pre‑defined sensor size."""
+    """Switch to "high", "mid" or "low" pre-defined sensor size."""
     cam = ensure_cam()
     try:
         cam.set_resolution(req.mode)
@@ -376,7 +403,7 @@ def canonical_id(dev_id: str) -> str:
     'tp-1-7-1351-25360'   →  'tp-1-1351-25360'
     'tp-1-13-1351-25360'  →  'tp-1-1351-25360'
     """
-    parts = dev_id.split('-')
+    parts = str(dev_id).split('-')
     if len(parts) >= 5:
         del parts[2]               # drop the port number
     return '-'.join(parts)

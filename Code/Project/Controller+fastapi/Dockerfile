@@ -5,7 +5,7 @@ FROM python:3.13-slim
 # Qt + X + noVNC runtime libs
 RUN apt-get update -y && apt-get install -y --no-install-recommends \
         libx11-6 libxext6 libxrender1 libxkbcommon-x11-0 libxcb-xinerama0 \
-        libegl1 libgl1-mesa-glx \
+        libegl1 \
         libfontconfig1   \       
         libfreetype6     \        
         fonts-dejavu-core \      

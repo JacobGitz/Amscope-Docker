@@ -1,3 +1,7 @@
+Last updated August 13th, 2025
+Written by Jacob Lazarchik
+Submit issues to my github (@JacobGitz)
+
 ------------------Intro to the "Code" Directory ----------------------------
 
 Welcome to my Code directory! If you are here, chances are you realize there are a bunch of directories; This readme is a description of each of these directories. 
@@ -30,17 +34,15 @@ ANY TIME YOU DO ANYTHING IN PYTHON, ALWAYS INCLUDE THIS.
 
 I suggest you refer to the top level "Documentation" directory. Inside of there is a presentation called "How To Docker #1". This covers what a requirements.lock (or .txt) file is and how to properly create one. You should read that presentation in entirety before even beginning to read any code in this project, or honestly ever coding. 
 
-It is absolutely necessary you create this file for all your projects, so people know the packages you used in your code, as well as their exact versions. Otherwise, you will damn people in the future who try to build a new docker image from your github project. Any time you do anything in python, ALWAYS INCLUDE THIS. 
+It is absolutely necessary you create this file for all your projects, so people know the packages you used in your code, as well as their exact versions. Otherwise, you will damn people in the future who try to build a new docker image from your github project. 
 
 I cannot stress this enough, if you do not include this file, you will make code that is buggy and basically useless in the long run. Once the packages are updated to newer versions, much of what you wrote will be left broken in entirety. 
 
 Even with this file, sometimes the old packages are not provided on the internet (or downloadable by pip install); For these reasons, I have included a "wheelhouse" directory, which fixes this problem. 
 
--------------------TDC001-Project(incorrectly named)------------------------------------------
+-------------------Project------------------------------------------
 
-This directory contains all the scripts that build up the GUI, API, and controller for making this whole project work for the amscope camera.
-
-In an ideal world, this directory will build 2 docker containers, one for the controller's api, another for the GUI. Hopefully, they network together and work amazing with zero problems.
+This directory contains all the scripts that build up the GUI, API, and controller for making this whole project work for the amscope camera. This contains basically everything relevant to the actual creation of docker images themselves. 
 
 -------------------wheelhouse-----------------------------------------
 
@@ -54,16 +56,19 @@ If you don't do this, I will personally rise from hell long after I leave the la
 
 -----------------.venv------------------------------------------
 
-ALSO ALWAYS MAKE THIS FOR ANYTHING IN PYTHON. This directory is known as a python "virtual environment". If you don't know how to create one, go ask ChatGPT or some other AI (idk what they will have in the future).
+This directory is known as a python "virtual environment". If you don't know how to create one, go ask ChatGPT or some other AI (idk what they will have in the future).
 
 A virtual environment stores the python version, all dependencies, everything. It is a self contained python install for running your scripts in a project. 
 
-enter random text here
 You can use this already existing .venv file by typing "source .venv/bin/activate" in Linux (command line or terminal). 
 
 If on Windows, you may need to create a new venv, or use windows subsystem linux (wsl)
 
 Once you do this, you can run any script I have made normally. Pretty useful.
+
+-----------------Amscope-Kai------------------------------------
+
+From the original guy (Kai) who wrote basic python in a day to get a camera running in the lab on windows. I repurposed his code and repo to get it running in docker containers.  
 
 
 

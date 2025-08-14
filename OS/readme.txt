@@ -1,72 +1,198 @@
-######################### Intro ###################################################################
+Last updated: August 13th, 2025
+Written by: Jacob Lazarchik
+Submit issues: @JacobGitz on GitHub
 
-These scripts automatically boot, build, save, load, and shutdown the 2 docker containers for this whole project easily on Linux.
+GOAL
+----
+Provide simple scripts to launch, build, save, load, and configure Docker images
+for lab devices (starting with an AmScope camera). You can bind a camera by its
+serial number to a specific Docker image and assign it a fixed network port.
+Images are portable and shareable across the lab.
 
-(For Windows, refer to the Windows directory in this repo.  For macOS, see the MacOS directory.)
+QUICK START (MOST PEOPLE)
+-------------------------
+1) Install Python 3.13 (or create a venv with Python 3.13).
+   - Windows installer is in: Prereqs/Windows
 
-For these shell scripts, just open a terminal in this directory and type
-    bash a-file.sh
-(replace with the name of the file you want to run) and it will do its thing.
+2) Install required Python packages:
+   - Open a command prompt in this directory, then run (If using Linux or WSL!):
+     "pip install --no-index --find-links=wheelhouse -r requirements.txt"
+   -For standard Windows, open a command prompt in this directory and run:
+      "pip install -r requirements.txt" (requires internet)
 
-You can also make them executable with
-    chmod +x file-name.sh
-They may already be, so right-click and see if it says “Run as Program”.
+3) Get the Docker images (too large for GitHub):
+   - Ask me for the .tar files, or use the lab NAS when available.
+   - Place all image .tar files in: /Docker-images
 
-######################### What Each Script Does ###################################################
+4) Start a device:
+   - Run: python launch.py
+   - Pick the service to launch.
+   - Your browser will open to the FastAPI docs at:
+     http://your-ip:assigned-port/docs
 
-  backend-launch.sh      → build / (re)start FastAPI backend   → opens http://localhost:8000/docs
-  frontend-launch.sh     → build / (re)start PyQt GUI frontend → opens http://localhost:6080
-  backend-shutdown.sh    → stop backend container, optional remove
-  frontend-shutdown.sh   → stop frontend container, optional remove
-  save-image.sh          → export ANY Docker image → ../Docker-images/<your-file>.tar
-  load-image.sh          → import a .tar from ../Docker-images/ → optional re-tag
+5) Windows USB note:
+   - If the camera shows as “not connected,” install and use the WSL USBIP-WIN
+     GUI provided in Prereqs/Windows to bind the USB device to Docker.
 
-*Launch order:* backend first, frontend second.  
-If the GUI whines that it can’t see the backend, kill the GUI container and run
-`frontend-launch.sh` again once the backend’s “/ping” endpoint replies.
+WHAT THESE SCRIPTS ENABLE
+-------------------------
+- Assign a specific camera (by serial number) to a unique Docker image and port.
+- Keep a “one device ↔ one image ↔ one port” structure for sanity in the lab.
+- Save and share built images as .tar files in /Docker-images.
+- Reuse and repurpose the same pattern for future devices.
 
-######################### Bugs you may encounter ##################################################
+REPOSITORY COMPOSE DEFAULTS
+---------------------------
+- The repo’s docker-compose includes two example services: camera-1 and camera-2.
+- Ask me for the corresponding images; they will also live on the lab NAS.
+- If someone gives you a new image, COPY THEIR docker-compose service block into
+  /Code/Project/docker-compose-backend.yml before launching.
 
-You may note on Linux and Windows these two containers do not work entirely out of the box (USB devices are not showing up)....
+REQUIREMENTS
+------------
+- Python 3.13 (system install or venv). Windows installer in Prereqs/Windows.
+- Python dependencies: PyYAML,PYUSB, etc. (included offline in wheelhouse for linux/WSL users).
+- Cloned repo does NOT include Docker images (too large); obtain from me/NAS and
+  place into /Docker-images before running launch.py.
 
-Docker Desktop runs in a hypervisor for compatibility, and USB devices must be passed through to the virtual machine for docker containers to use them.
+OFFLINE DOCS & SLIDES
+---------------------
+- “How to Docker” presentation in /Documentation explains:
+  - Building wheelhouse directories
+  - Using pip freeze to lock requirements
+  - General workflow for this project
 
-There is something called usbipd or something in the Docker documentation, and several softwares that allow you to provide USB devices to containers.
+LAUNCHING & SHARING IMAGES
+--------------------------
+- New images you build are written to /Docker-images as .tar archives.
+- These can be distributed to others; they just drop them into /Docker-images.
+- If you’re using someone else’s image:
+  1) Paste their service block into /Code/Project/docker-compose-backend.yml
+  2) Ensure the image .tar filename in /Docker-images matches the compose entry
 
-I supplied notes for this on Windows in my original stable release (main-branch readme.md), but not for Linux. It was *partially incorrectly* discussed in the presentation as well.
+================================================================================
+FILE / DIRECTORY REFERENCE
+================================================================================
 
-(On a side note, I highly suggest you read the How-to-Docker presentation in the Documentation directory in this repo.)
+amcam.py
+--------
+- Current helper that detects connected AmScope cameras and returns serial IDs.
+- Used by setup.py to pair a specific camera serial with an image and port.
+- Only supports AmScope; long-term plan is to remove this dependency and move to
+  a universal approach.
+- NOTE: This is for configuration time; launch.py itself does not depend on it.
 
-But, if you run the frontend on a Linux machine, and then the backend on a separate Windows machine (with usbipd-win or whatever I discussed in readme.md) then it will work successfully.
+launch.py
+---------
+- Looks in /Code/Project for a docker-compose YAML file.
+- Lists defined services and asks which you want to start.
+- Verifies the required .tar image exists in /Docker-images; if not, it exits.
+  Example: service “camera-1” expects an image file like:
+           amscope-camera-backend_camera-1.tar
+- If you don’t have a matching .tar, either obtain it from NAS/me, or run
+  setup.py to build a new one.
+- After starting the container with the compose settings, opens:
+  http://your-ip:assigned-port/docs
+- If you built a custom image or edited the compose, PLEASE commit your updated
+  compose and upload the .tar to the NAS so the lab stays consistent.
 
-(backend first, then frontend, otherwise frontend won't see backend, restart frontend container if you cannot find the proper backend)
+Legacy/
+-------
+- Older shell script prototypes. Buggy and superseded, but kept for reference.
 
-Another common issue is that stuff isn't working anymore if you unplug a USB device while these containers are running. Reboot them.
+libamcam.so
+-----------
+- Native driver used by amcam.py (Linux/macOS).
+- setup.py relies on amcam.py/libamcam.so, but launch.py doesn't
+- Long-term plan: remove .so/.dll reliance and use a standard Python USB library.
+- For WSL setup details, see the main README in the original TDC001-Docker repo.
 
-######################### Saving & Loading Images #################################################
+readme.txt
+----------
+- This file.
 
-*Need to move this setup to an offline PC?*  
+requirements.txt
+----------------
+- Pinned Python dependencies for the scripts here. Generated via pip freeze.
+- See “How to Docker” slides for instructions on creating/updating this file.
 
-1.  Run **save-image.sh** on a box that already has the image.  
-    Pick the image, accept the suggested filename (or type your own), and a
-    `.tar` lands in `../Docker-images/`.
+setup.py
+--------
+- For maintainers/advanced users to create or modify device images.
+- Windows + Linux supported; Windows USB detection can be finicky and will be
+  patched. Make sure the device is NOT bound to WSL in the USB passthrough GUI
+  when you run setup.py from the host Python, or the host won’t see the device.
+-Works perfectly on linux
 
-2.  Copy that `.tar` to the new machine (USB stick, network share, whatever).
+- What it does:
+  • ADD — append a fully configured camera service block to docker-compose
+  • DELETE — remove a service block from docker-compose
+  • Writes device_config.json into Code/Project/Controller+fastapi/ before builds
+    (stores device info inside the image)
+  • Optionally builds the new image and always exports it as:
+    Docker-images/<image>_<tag>.tar
+  • Prevents duplicate service names and host-side ports
 
-3.  On the new box run **load-image.sh**.  
-    Pick the tar, optionally give it a new tag, and you’re ready to `backend-launch.sh`.
+- Future improvements:
+  • Remove dependence on amcam.py and native drivers
+  • Use a standard Python USB library to grab serial numbers and write
+    device_config.json
 
-Images are big – stick them on the lab NAS if you can.
+wheelhouse/
+-----------
+- Contains .whl files for offline/long-term installs (e.g., PyYAML).
+- Lets you install requirements to run these scripts without internet. Keep this up-to-date.
+- See “How to Docker” slides for how to create and maintain this directory.
 
-############## Notes for a Future Person ##########################################################
+================================================================================
+TROUBLESHOOTING & NOTES
+================================================================================
 
-For a future person in 2035 or something, this building process *may* fail if you try to do it from scratch in this script. Hopefully, pre-built images from this time (2025) will be stored somewhere and just run those instead. You can build on top of those and edit those internally to get what you like and make revised images from them.
+USB / Docker Desktop
+--------------------
+- On Windows and some Linux setups, containers won’t see USB devices “out of the
+  box” because Docker Desktop runs in a hypervisor.
+- You must pass USB devices into the VM. On Windows, use usbipd / WSL USBIP-WIN GUI (in prereqs).
+- I provided notes for Windows in the TDC001-Docker repo (main branch README).
+- On Linux, Docker *native* (not Desktop) avoids the VM and USB passthrough,
+  so USB generally works without extra steps.
 
-However, in the case you do not like my code or existing images, you can rebuild from scratch using these scripts. If it nukes itself during this process, chances are it is pulling the base "python 3.13 slim" images in the Dockerfiles from Docker Hub, as well as a bunch of other online dependencies for Ubuntu, and this causes the problem.
+Runtime disconnects
+-------------------
+- If you unplug a USB device while a container is running, things may break and you may have to restart the container and check binding. 
 
-I will try my best to store everything that is an online dependency for the build process in this git repo, but not all of it can be submitted to Github. So, hopefully we have network storage in the lab or a drive which stores this git repo and stores of all the original Ubuntu dependencies and the base python image as well.
+General reading
+---------------
+- Strongly recommend reviewing the “How to Docker” presentation in /Documentation.
 
-If everything goes wrong, contact a guy named Jacob Lazarchik (me) at lazarchik.jacob@gmail.com, maybe spam me a bit or submit a git issue to my repo on github.
+================================================================================
+FUTURE-PROOFING (HELLO, 2035)
+================================================================================
+- If building from scratch fails in the future, prefer using the pre-built 2025
+  images from the NAS, then modify them.
+- Failures usually come from pulling base images (e.g., “python:3.13-slim”) and
+  various Ubuntu dependencies from the internet, which may have changed.
+- I’m trying to store as many build-time dependencies as possible in this repo,
+  but not everything fits on GitHub. Keep a lab NAS or external drive that holds:
+  • This git repo
+  • The pre-built images (.tar)
+  • Mirrors/archives of base images and OS package deps (when feasible)
 
-(I don't check my email often lol)
+================================================================================
+RUNNING THE CAMERA (DETAIL)
+================================================================================
+- Use command line:  python launch.py
+  (Double-clicking scripts also works, but the window may close on errors.)
+
+- Windows: If the camera shows “not connected,” install and use the WSL USBIP-WIN
+  GUI (installer in Prereqs/Windows) to bind the USB device for Docker.
+
+================================================================================
+CONTACT
+================================================================================
+If everything goes wrong, contact:
+- Jacob Lazarchik — lazarchik.jacob@gmail.com
+- Or open an issue on GitHub: @JacobGitz
+
+(I don’t check email often lol)
 

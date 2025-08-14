@@ -1,7 +1,7 @@
 {
-  "device_id": "tp-1-10-1351-54544",
+  "device_id": "\\\\?\\usb#vid_0547&pid_d510#5&1fe0a373&0&10",
   "device_name": "MU503B(USB2.0)",
   "serial_number": "TP180718091837E75CD24A4DDE4ACC6",
-  "vendor_id": null,
-  "product_id": null
+  "vendor_id": "0x0547",
+  "product_id": "0xd510"
 }
