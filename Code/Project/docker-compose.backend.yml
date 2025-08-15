@@ -10,16 +10,29 @@ services:
     - 8002:8000
     privileged: true
     restart: unless-stopped
-  cam1:
+  cam2:
     build: ./Controller+fastapi
-    container_name: cam1
+    container_name: cam2
     devices:
     - /dev:/dev
     environment:
       PORT: '8000'
       TZ: America/New_York
-    image: amscope-camera-backend:cam1
+    image: amscope-camera-backend:cam2
     ports:
-    - 8000:8000
+    - 8001:8000
+    privileged: true
+    restart: unless-stopped
+  cam3:
+    build: ./Controller+fastapi
+    container_name: cam3
+    devices:
+    - /dev:/dev
+    environment:
+      PORT: '8000'
+      TZ: America/New_York
+    image: amscope-camera-backend:cam3
+    ports:
+    - 8003:8000
     privileged: true
     restart: unless-stopped

@@ -2,7 +2,6 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Amscope-Docker</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 </head>
 <body>
@@ -85,22 +84,22 @@ For the camera use-case, the GUI component is not included – you can use the s
   </li>
   <br>
   <li>
-    (Optional) Open PowerShell or CMD as Administrator and install a Linux distribution for WSL2 (Fedora 42 is tested, but other distros can work as well):
+    (Required) Open PowerShell or CMD as Administrator and install Fedora for WSL2:
     <pre><code>wsl --install -d FedoraLinux-42</code></pre>
   </li>
   <br>
   <li>
-    (Optional) After installation, enable the distro in Docker Desktop: go to <strong>Settings &rarr; Resources &rarr; WSL Integration</strong> and ensure your WSL distro (e.g., <code>FedoraLinux-42</code>) is enabled.
+    (Required) After installation, enable the distro in Docker Desktop: go to <strong>Settings &rarr; Resources &rarr; WSL Integration</strong> and ensure your WSL distro (e.g., <code>FedoraLinux-42</code>) is enabled.
   </li>
   <br>
   <li>
-    (Optional) Set the new distro as the default for WSL2:
+    (Required) Set the new distro as the default for WSL2:
     <pre><code>wsl --set-default FedoraLinux-42</code></pre>
     Now, running <code>wsl</code> with no arguments will drop you into the Fedora WSL shell by default. (Type <code>exit</code> to leave the WSL shell.)
   </li>
   <br>
   <li>
-    (Optional) Install <a href="https://github.com/dorssel/usbipd-win" target="_blank" rel="noopener noreferrer">usbipd-win</a> to enable USB passthrough. Then, from an elevated PowerShell or CMD, enumerate and bind the camera’s USB device to WSL:
+    (Optional - For debugging) Install <a href="https://github.com/dorssel/usbipd-win" target="_blank" rel="noopener noreferrer">usbipd-win</a> to enable USB passthrough. Then, from an elevated PowerShell or CMD, enumerate and bind the camera’s USB device to WSL:
     <pre><code>usbipd list
 usbipd wsl bind --busid &lt;BUS-ID&gt;
 # If needed on some systems:
@@ -184,11 +183,10 @@ Use a web browser or any HTTP client to interact with the camera’s REST API. T
 <ul>
   <li>[x] Containerized camera backend (FastAPI API for image capture)</li>
   <li>[x] Cross-platform support (Linux &amp; WSL; basic Windows native compatibility)</li>
-  <li>[ ] Live stream support (continuous video feed endpoint or viewer)</li>
-  <li>[ ] Optional GUI front-end for live preview and manual control (e.g., PyQt6 or web-based UI)</li>
-  <li>[ ] Cross-platform installer or packaged release (one-click install for end-users, bundling the appropriate camera driver for each OS)</li>
-  <li>[ ] macOS support for camera (testing with <code>libamcam.dylib</code> once USB access is resolved)</li>
-  <li>[ ] Integration with third-party analysis software (e.g., pipeline data from the camera API into image analysis tools)</li>
+  <li>[X] Live stream support (continuous video feed endpoint or viewer)</li>
+  <li>[] Optional GUI front-end for live preview and manual control (e.g., PyQt6 or web-based UI)</li>
+  <li>[] Cross-platform installer or packaged release (one-click install for end-users, bundling the appropriate camera driver for each OS)</li>
+  <li>[] macOS support for camera (testing with <code>libamcam.dylib</code> once USB access is resolved)</li>
 </ul>
 
 <!-- TROUBLESHOOTING -->
@@ -202,8 +200,8 @@ Use a web browser or any HTTP client to interact with the camera’s REST API. T
     <td>Backend doesn’t detect the camera device</td>
     <td>
       <ul>
-        <li><strong>Windows (WSL2):</strong> Ensure you have bound the USB device in <code>usbipd</code> (see Getting Started step 5).</li>
-        <li><strong>Windows (native):</strong> Make sure <code>amcam.dll</code> is present and the Python code can load it.</li>
+        <li><strong>Windows (Docker Container):</strong> Ensure you have bound the USB device in the USB Device GUI (see Getting Started step 5).</li>
+        <li><strong>Windows (Host Mode):</strong> Make sure <code>amcam.dll</code> is present and the Python code can load it. Also make sure it is detached from WSL/Docker with the USB GUI.</li>
         <li><strong>Linux:</strong> If using Docker, run the container with <code>--privileged</code>.</li>
       </ul>
     </td>
@@ -232,7 +230,7 @@ Use a web browser or any HTTP client to interact with the camera’s REST API. T
 
 <!-- DEVELOPMENT & REPURPOSING -->
 <h2 id="development-repurposing">🧰 Development &amp; Repurposing</h2>
-<p><strong>Project Structure:</strong> The code is organized to separate hardware interaction from the API logic.</p>
+<p><strong>Project Structure:</strong> amscope_server.py (in Controller+fastapi) and vendor_serial_identification.py (in OS) are the two major files you should mostly need to work with. The remaining majority is agnostic to whatever device you are trying to put into a docker image. </p>
 
 <!-- CONTRIBUTING -->
 <h2 id="contributing">🤝 Contributing</h2>

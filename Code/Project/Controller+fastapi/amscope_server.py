@@ -1,26 +1,43 @@
 #!/usr/bin/env python3
 """
-Modified FastAPI backend for AmScope/Toupcam cameras
-====================================================
+FastAPI backend for AmScope/Toupcam cameras (serial-number only)
+================================================================
 
-This server exposes a minimal REST API to a single AmScope camera.  It is
-designed to be run inside a dedicated Docker container where exactly one
-camera is available.  Unlike the original implementation, this version
-removes public endpoints that enumerate or switch cameras at runtime.  A
-separate setup script (see ``setup.py``) is used to select which USB
-camera should be associated with the container.  The selected camera's
-identifier and friendly name are stored in a small JSON file (by default
-``device_config.json``) that the API reads on startup.  During startup
-the server attempts to open that specific device and ignores any other
-connected cameras.  The ``/ping`` endpoint has also been extended to
-report whether the assigned device is currently attached to the system.
+This server exposes a minimal REST API to a single AmScope camera. It is
+intended to run in a dedicated container where exactly one camera is available.
 
-All of the functionality for controlling exposure, gain, resolution and
-streaming frames remains intact and is exposed via the same endpoints
-used previously.  Removing the enumeration endpoints prevents a client
-from accidentally connecting to the wrong camera when multiple devices
-are present in the lab.
+Key design choices (easy to reason about for newcomers):
 
+1) **Serial-only selection**
+   We *only* use the camera's immutable serial number (from
+   `device_config.json` → key `serial_number`) to decide which device to open.
+   We intentionally ignore volatile identifiers like USB paths or `device_id`.
+
+2) **Non-disruptive presence checks**
+   The `/get_ping` health endpoint checks whether the target serial is present
+   *without* disturbing a live stream:
+   - If the camera is already open, we compare the cached serial.
+   - Otherwise we briefly open each enumerated slot just long enough to read
+     the serial number, then immediately close it.
+
+3) **Single, long-lived handle**
+   When we do open the camera, we keep one handle alive for the whole lifetime
+   of the process (until shutdown). All imaging and control calls use that
+   single handle.
+
+What the API provides:
+- `/get_status`     → basic camera status (size, exposure, gain, FPS)
+- `/set_gain`       → set manual gain
+- `/set_exposure`   → set manual exposure (µs)
+- `/auto_exposure`  → enable/disable auto exposure
+- `/set_resolution` → pick among "high" | "mid" | "low" sensor presets
+- `/get_frame`      → latest frame as PNG (pulls from a rolling buffer)
+- `/get_stream`     → MJPEG stream (browser-friendly live preview)
+- `/get_ping`       → health check (connected/not-connected/not-configured)
+
+New to FastAPI / this codebase?  Read comments top-to-bottom once; they're
+written for folks who are comfortable editing Python but may be new to vendor
+SDKs, threads, or streaming endpoints.
 """
 
 from __future__ import annotations
@@ -32,94 +49,297 @@ import json
 import os
 import threading
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 # ── third-party ───────────────────────────────────────────────────────
-import amcam                              # Vendor SDK Python wrapper
+# `amcam` is the vendor SDK's Python wrapper (Toupcam/AmScope).  This module
+# provides `Amcam.EnumV2()` to list cameras, `Amcam.OpenByIndex(i)` to open a
+# camera by its index in that list, and instance methods like
+# `hcam.SerialNumber()`, `hcam.get_Size()`, `hcam.StartPullModeWithCallback(...)`,
+# etc.
+import amcam
+
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
-from PIL import Image                     # Pillow (add to requirements)
+from PIL import Image  # Pillow – used to encode PNG/JPEG frames
 
+# These imports are occasionally useful in deployments. We keep them here so
+# folks can add small processing steps without chasing imports.
+import cv2  # noqa: F401
+import numpy as np  # noqa: F401
 
-# Path to the device configuration file.  A different path can be supplied
-# by setting the ``DEVICE_CONFIG`` environment variable when launching
-# the container.  The file should contain a JSON object with two keys:
-# ``device_id`` (the opaque identifier returned by ``amcam.Amcam.EnumV2``)
-# and ``device_name`` (a human readable label for the camera).  See
-# ``setup.py`` for a helper script that populates this file.
+# Path to the device configuration file.  Override by setting the
+# DEVICE_CONFIG environment variable when launching the container.
 CONFIG_PATH: str = os.getenv("DEVICE_CONFIG", "device_config.json")
 
-# Internal record of the camera that the API should manage.  These
-# variables are populated during startup by reading the configuration
-# file and then locating the corresponding device through the amcam SDK.
-assigned_device_id: Optional[str] = None
+# Internal record of the camera that the API should manage.
+# We deliberately do *not* store or reference `device_id` anywhere.
 assigned_device_name: Optional[str] = None
+assigned_device_serial: Optional[str] = None  # the only selector we use
 
-# Global singleton (one camera per backend container)
+# Global singleton (one camera per backend container).  We keep an instance of
+# `CameraController` here once a camera is opened.
 camera: "CameraController | None" = None
 
-app = FastAPI(title="AmScope Camera API", version="0.2.1")
+# Create the FastAPI app.  Uvicorn will import this as `amscope_server:app`.
+app = FastAPI(title="AmScope Camera API", version="0.4.0")
+
+
+# ───────────────────── config & helpers ───────────────────────────────
+def _canon_serial(s: str | bytes | None) -> str:
+    """Return a normalized (canonical) serial string.
+
+    Why: serials can come back as bytes, lowercase, or with stray characters
+    depending on the SDK/backends.  For robust comparisons we:
+    - decode bytes → str (UTF-8, ignoring odd bytes)
+    - uppercase
+    - drop all non-alphanumeric characters
+    """
+    if s is None:
+        return ""
+    if isinstance(s, bytes):
+        try:
+            s = s.decode("utf-8", "ignore")
+        except Exception:
+            s = str(s)
+    return "".join(ch for ch in str(s).upper() if ch.isalnum())
 
 
 def load_config() -> None:
-    """Load the assigned device information from ``CONFIG_PATH``.
+    """Load `device_config.json` and populate globals.
 
-    This helper populates the global ``assigned_device_id`` and
-    ``assigned_device_name`` variables.  If the file cannot be read or
-    does not contain the expected keys, both variables are set to ``None``.
+    This function reads only two keys: `device_name` and `serial_number`.
+    Any `device_id` present in the file is intentionally ignored.
+
+    On any error, we leave the globals as `None` so endpoints can report
+    "not-configured".
     """
-    global assigned_device_id, assigned_device_name
+    global assigned_device_name, assigned_device_serial
+    assigned_device_name = None
+    assigned_device_serial = None
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-        assigned_device_id = cfg.get("device_id")
         assigned_device_name = cfg.get("device_name")
+        assigned_device_serial = cfg.get("serial_number")
     except Exception:
-        assigned_device_id = None
-        assigned_device_name = None
+        # Silently ignore – consumers will surface a clear status.
+        pass
 
 
-class ConnectRequest(BaseModel):
-    # This model remains for backwards compatibility but is unused in
-    # the modified API.  The ``index`` field is ignored because the
-    # container will always connect to the device specified in the
-    # configuration file.
-    index: int = 0
+def _read_serial_by_index_once(index: int) -> str:
+    """Open by index, read serial, and ALWAYS close (safe for presence checks).
+
+    We use this for `/get_ping` when we don't already have a live handle.  It
+    prevents double-opening the same device for long, which some SDKs dislike.
+    """
+    try:
+        h = amcam.Amcam.OpenByIndex(index)
+    except Exception:
+        return ""
+    try:
+        return _canon_serial(h.SerialNumber())
+    except Exception:
+        return ""
+    finally:
+        try:
+            h.Close()
+        except Exception:
+            pass
 
 
+def _open_handle_and_read_serial_by_index(index: int) -> Tuple[Optional[amcam.Amcam], str]:
+    """Open a device by index and return a *live handle* plus its canonical serial.
+
+    This function is for the one-time *real* open during startup when we want
+    to KEEP the handle (we do not close it here).  For presence checks, use
+    `_read_serial_by_index_once` instead.
+    """
+    print("INFO: method _open_handle_and_read_serial_by_index() was called in amscope_server.py")
+    try:
+        h = amcam.Amcam.OpenByIndex(index)
+    except Exception:
+        print("WARNING: _open_handle_and_read_serial_by_index(index) was given an index that doesn't exist!")
+        return None, ""
+    try:
+        raw = h.SerialNumber()
+        sn = _canon_serial(raw)
+    except Exception:
+        print("WARNING: h.SerialNumber() failed in _open_handle_and_read_serial_by_index()")
+        try:
+            h.Close()
+        except Exception:
+            pass
+        return None, ""
+    print(f"INFO: _open_handle_and_read_serial_by_index() returned (index,sn): {index} {sn}")
+    return h, sn
+
+
+# NOTE: The function below is duplicated later in the original working file.
+# Keeping a single definition is cleaner; Python will use the *last* definition
+# it sees. We retain this one (the early definition) and comment on the later
+# duplicate to avoid confusing new contributors.
+
+def _serial_present(wanted_serial: str) -> bool:
+    """Return True if a device with the given serial is currently attached.
+
+    Order of checks:
+    1) If the camera is already open, compare the live handle's serial (fast,
+       no re-open, doesn't risk the stream).
+    2) Otherwise enumerate and probe each index (open→read→close) to find the
+       matching serial.
+    """
+    wanted = _canon_serial(wanted_serial)
+    print("INFO: _serial_present in amscope_server.py is checking for serial number " + wanted)
+    if not wanted:
+        return False
+
+    # 1) Fast-path: if a camera is open, check its serial without re-opening.
+    global camera
+    if camera is not None:
+        try:
+            current = _canon_serial(camera.hcam.SerialNumber())
+            print(f"INFO: open handle reports serial: {current}")
+            if current == wanted:
+                return True
+        except Exception:
+            print("WARNING: could not read SerialNumber() from existing handle; continuing with probe")
+
+    # 2) Slow-path: enumerate and probe each slot safely.
+    try:
+        cams = amcam.Amcam.EnumV2()
+        if len(cams) >= 1:
+            print("INFO: amcam.py is working normally")
+    except Exception:
+        print("WARNING: Amcam EnumV2() is failing to find devices for some reason!")
+        return False
+
+    for i in range(len(cams)):
+        sn = _read_serial_by_index_once(i)
+        if sn:
+            print(f"INFO: found camera slot {i} with serial: {sn}")
+        else:
+            print(f"INFO: found camera slot {i} but could not read serial (likely already open elsewhere)")
+        if sn == wanted:
+            return True
+    return False
+
+
+def _find_and_open_by_serial(wanted_serial: str) -> Optional[amcam.Amcam]:
+    """Search all enumerated cameras for a matching serial and open it.
+
+    Returns an *open* handle if found, otherwise `None`.
+    """
+    print("INFO: method _find_and_open_by_serial() was called in amscope_server.py")
+    wanted = _canon_serial(wanted_serial)
+    print("INFO: _find_and_open_by_serial() in amscope_server.py is looking for sn: " + wanted)
+    if not wanted:
+        return None
+    try:
+        cams = amcam.Amcam.EnumV2()
+    except Exception:
+        return None
+
+    for i in range(len(cams)):
+        h, sn = _open_handle_and_read_serial_by_index(i)
+        if not h:
+            continue
+        if sn == wanted:
+            print("INFO: Camera with desired serial number found!")
+            return h  # keep it open for the caller
+        else:
+            print("WARNING: index", i, "serial", sn, "!= wanted", wanted)
+            try:
+                h.Close()
+            except Exception:
+                pass
+    return None
+
+
+# --- BEGIN: Duplicate (from original working paste) -------------------
+# The block below is functionally identical to the earlier `_serial_present`.
+# Python will use *this* (later) definition at runtime, shadowing the earlier
+# one. We keep it here to preserve your original working file structure, but
+# recommend removing the duplication to avoid confusion for new contributors.
+
+def _serial_present(wanted_serial: str) -> bool:  # duplicate definition
+    """Duplicate of `_serial_present` (kept to match original working file).
+
+    Return True if a device with the given serial is currently attached.
+    """
+    wanted = _canon_serial(wanted_serial)
+    print("INFO: _serial_present in amscope_server.py is checking for serial number " + wanted)
+    if not wanted:
+        return False
+
+    global camera
+    if camera is not None:
+        try:
+            current = _canon_serial(camera.hcam.SerialNumber())
+            print(f"INFO: open handle reports serial: {current}")
+            if current == wanted:
+                return True
+        except Exception:
+            print("WARNING: could not read SerialNumber() from existing handle; continuing with probe")
+
+    try:
+        cams = amcam.Amcam.EnumV2()
+        if len(cams) >= 1:
+            print("INFO: amcam.py is working normally")
+    except Exception:
+        print("WARNING: Amcam EnumV2() is failing to find devices for some reason!")
+        return False
+
+    for i in range(len(cams)):
+        sn = _read_serial_by_index_once(i)
+        if sn:
+            print(f"INFO: found camera slot {i} with serial: {sn}")
+        else:
+            print(f"INFO: found camera slot {i} but could not read serial (likely already open elsewhere)")
+        if sn == wanted:
+            return True
+    return False
+# --- END: Duplicate ----------------------------------------------------
+
+
+# ───────────────────── models (request bodies) ────────────────────────
+# Pydantic models validate incoming JSON payloads for POST endpoints.
 class GainRequest(BaseModel):
-    gain: int  # 100–300 %
+    gain: int  # expected range: 100–300 % (from vendor docs)
 
 
 class ExposureRequest(BaseModel):
-    us: int  # micro-seconds
+    us: int  # exposure in microseconds
 
 
 class AutoExpRequest(BaseModel):
-    enabled: bool
+    enabled: bool  # True to enable auto exposure, False to disable
 
 
 class ResolutionRequest(BaseModel):
     mode: str  # "high" | "mid" | "low"
 
 
+# ───────────────────── camera controller wrapper ──────────────────────
 class CameraController:
-    """
-    Thin wrapper around ``amcam.Amcam`` providing:
+    """Tiny helper class around a live `amcam.Amcam` handle.
 
-    • persistent frame buffer
-    • background callback to pull frames
-    • convenience setters/getters
+    Responsibilities:
+    - Set a safe default resolution for previews
+    - Maintain a rolling RGB frame buffer in memory
+    - Track FPS (frames per second) roughly once per second
+    - Expose convenience setters/getters (gain/exposure/AE/resolution)
+    - Start the SDK's pull-mode callback to receive frames continuously
+
+    The SDK calls our `_sdk_cb` whenever a new frame is ready. We copy it into
+    `self.buf` and stash a Python `bytes` snapshot in `self._latest_raw`.
     """
 
     def __init__(self, dev: amcam.Amcam) -> None:
         self.hcam = dev
 
-        # ---------- SAFE DEFAULT PREVIEW SIZE ----------
-        # Some cameras expose fewer than 3 resolutions; hard-coding index 2
-        # can raise E_INVALIDARG (-2147024809). Choose a valid index:
-        # prefer "index 2" when it exists, else the highest available, else 0.
+        # 1) Choose a conservative default resolution (so UIs load quickly).
         try:
             res_cnt = int(self.hcam.ResolutionNumber())
         except Exception:
@@ -128,56 +348,59 @@ class CameraController:
         if res_cnt <= 0:
             default_idx = 0
         elif res_cnt > 2:
+            # If the camera exposes 3+ sizes, pick a mid/low-ish one (index 2)
+            # for startup preview. Users can switch to "high" later.
             default_idx = 2
         else:
+            # If 1 or 2 modes exist, pick the smaller one (0 for 1-mode, 1 for 2-mode)
             default_idx = res_cnt - 1  # 1→0, 2→1
 
         try:
             self.hcam.put_eSize(default_idx)
         except amcam.HRESULTException:
-            # Fallback to index 0 if the preferred index is invalid for this model
+            # Fallback: try index 0 if the preferred one fails
             try:
                 self.hcam.put_eSize(0)
             except Exception:
-                # As a last resort, continue with whatever size the camera boots with
                 pass
-        # ------------------------------------------------
 
+        # 2) Cache the active width/height.
         self.w, self.h = self.hcam.get_Size()
 
-        # Thread-safe storage for the latest raw RGB frame
+        # 3) Concurrency primitives + rolling buffer for latest RGB frame.
         self._raw_lock = threading.Lock()
         self._latest_raw: bytes | None = None
 
-        # Stats for FPS calculation
+        # 4) FPS stats (computed about once per second in the callback).
         self._frame_count = 0
         self._last_tick = time.perf_counter()
         self.fps = 0.0
 
-        # Allocate one RGB888 buffer big enough for the chosen size
-        stride = ((self.w * 24 + 31) // 32) * 4         # 4-byte aligned
+        # 5) Allocate a single RGB888 buffer of appropriate stride.
+        # Stride is rounded up to a 4-byte boundary (typical SDK requirement).
+        stride = ((self.w * 24 + 31) // 32) * 4
         self.buf = ctypes.create_string_buffer(stride * self.h)
         self.stride = stride
 
-        # Kick off continuous streaming; ``self._sdk_cb`` will fire per frame
+        # 6) Start the SDK in pull-mode with our callback.
         self.hcam.StartPullModeWithCallback(self._sdk_cb, self)
 
-    # ------------------------------------------------------------------
-    # SDK callback – runs on SDK thread, *not* the FastAPI thread pool
-    # ------------------------------------------------------------------
     @staticmethod
     def _sdk_cb(event: int, ctx: "CameraController"):
+        """SDK callback (runs on a background thread provided by the SDK).
+
+        We only care about image events. When one arrives, we ask the SDK to
+        fill our preallocated RGB buffer, then atomically swap in a Python
+        `bytes` copy for the web endpoints to read.
+        """
         if event != amcam.AMCAM_EVENT_IMAGE:
-            return  # Ignore non-image events for now
-        try:
-            ctx.hcam.PullImageV2(ctx.buf, 24, None)
-        except amcam.HRESULTException:
-            # USB glitch → just drop the frame
             return
-        # Copy the buffer to bytes so FastAPI threads can use it safely
+        try:
+            ctx.hcam.PullImageV2(ctx.buf, 24, None)  # 24 = RGB888
+        except amcam.HRESULTException:
+            return
         with ctx._raw_lock:
             ctx._latest_raw = bytes(ctx.buf)
-        # --- Simple FPS meter (1-second sliding window) ---------------
         ctx._frame_count += 1
         now = time.perf_counter()
         if now - ctx._last_tick >= 1.0:
@@ -185,9 +408,7 @@ class CameraController:
             ctx._frame_count = 0
             ctx._last_tick = now
 
-    # ------------------------------------------------------------------
-    # Convenience setters/getters used by endpoints
-    # ------------------------------------------------------------------
+    # --- Simple setters / getters for camera controls -----------------
     def set_gain(self, gain: int) -> None:
         self.hcam.put_ExpoAGain(gain)
 
@@ -199,12 +420,7 @@ class CameraController:
         self.hcam.put_AutoExpoEnable(enabled)
 
     def set_resolution(self, mode: str) -> None:
-        """
-        Change sensor binning/ROI for "high", "mid", or "low".
-
-        Implements:  Stop → eSize → re-alloc buffer → Start
-        """
-        # --- translate mode → index -----------------------------------
+        # Translate a human-friendly mode string into a sensor index.
         res_cnt = self.hcam.ResolutionNumber()
         if res_cnt <= 0:
             raise ValueError("No resolutions reported by camera")
@@ -215,15 +431,13 @@ class CameraController:
         elif mode.lower() == "low":
             idx = min(range(res_cnt), key=lambda i: sizes[i][0] * sizes[i][1])
         elif mode.lower() == "mid" and res_cnt > 2:
-            idx = sorted(
-                range(res_cnt), key=lambda i: sizes[i][0] * sizes[i][1]
-            )[res_cnt // 2]
+            idx = sorted(range(res_cnt), key=lambda i: sizes[i][0] * sizes[i][1])[res_cnt // 2]
         else:
             raise ValueError(f"{mode!r} not available; camera has {res_cnt} mode(s)")
 
-        # --- state change sequence ------------------------------------
+        # Applying a new size typically requires stopping the stream briefly.
         self.hcam.Stop()
-        time.sleep(0.2)  # allow firmware to settle
+        time.sleep(0.2)
         self.hcam.put_eSize(idx)
         self.w, self.h = self.hcam.get_Size()
         self.stride = ((self.w * 24 + 31) // 32) * 4
@@ -231,7 +445,6 @@ class CameraController:
         self.hcam.StartPullModeWithCallback(self._sdk_cb, self)
 
     def status(self) -> dict:
-        """Return a dict used by GET /status"""
         return {
             "width": self.w,
             "height": self.h,
@@ -242,7 +455,6 @@ class CameraController:
         }
 
     def close(self) -> None:
-        """Gracefully stop streaming and close USB handle."""
         try:
             self.hcam.Stop()
         except Exception:
@@ -250,20 +462,41 @@ class CameraController:
         self.hcam.Close()
 
 
-# ───────────────────── helper utilities ───────────────────────────────
+# ───────────────────── helper utilities (not routes) ──────────────────
 def list_cameras() -> List[dict]:
-    """Return a list of cameras detected by the SDK.
+    """Return a list of detected cameras with *names and serials only*.
 
-    Each entry contains the device index and the display name.  This
-    function remains useful for the setup script but is no longer
-    exposed as a FastAPI route.
+    This helper is useful when building UIs that let users pick a camera by
+    serial. We intentionally do *not* expose SDK-specific IDs here to keep
+    everything serial-centric.
     """
-    cams = amcam.Amcam.EnumV2()
-    return [{"index": i, "id": c.id, "name": c.displayname} for i, c in enumerate(cams)]
+    out: List[dict] = []
+    try:
+        cams = amcam.Amcam.EnumV2()
+    except Exception:
+        return out
+    for i in range(len(cams)):
+        name = getattr(cams[i], "displayname", None)
+        h, sn = _open_handle_and_read_serial_by_index(i)
+        if h:
+            try:
+                h.Close()
+            except Exception:
+                pass
+        out.append({
+            "index": i,
+            "name": name,
+            "serial": sn or None,
+        })
+    return out
 
 
 def ensure_cam() -> CameraController:
-    """HTTP 503 if no camera is currently connected/opened."""
+    """Fetch the global camera controller or raise a 503 error.
+
+    Many endpoints rely on the camera being connected; this helper centralizes
+    that check and returns a consistent HTTP error if not.
+    """
     if camera is None:
         raise HTTPException(status_code=503, detail="Camera not connected.")
     return camera
@@ -272,40 +505,27 @@ def ensure_cam() -> CameraController:
 # ───────────────────── app lifecycle hooks ────────────────────────────
 @app.on_event("startup")
 def _startup() -> None:
-    """
-    Attempt to connect to the configured camera on startup.
+    """Attempt to connect to the configured camera by serial at process start.
 
-    When the server boots it reads the ``device_config.json`` file (or
-    another file specified by ``DEVICE_CONFIG``) and then searches for a
-    matching device in the list returned by ``amcam.Amcam.EnumV2``.
-    If a match is found a ``CameraController`` is created and stored in
-    the module-level ``camera`` variable.  If no match is found the
-    server starts in a degraded state where control endpoints will
-    return HTTP 503.
+    If the serial is missing or the device isn't present, we start without a
+    camera. Endpoints will return clear errors until the device is attached
+    and the process restarted (or until you add hot-plug logic).
     """
     global camera
     load_config()
-    cams = amcam.Amcam.EnumV2()
-    if assigned_device_id:
-        # Try to locate the configured device by ID
-        for dev in cams:
-            # ``dev.id`` on Linux/Mac is a string; on Windows it's a pointer
-            # object that ``amcam.Amcam.Open`` accepts directly.  We use
-            # string comparison where possible but fall back to equality.
-            try:
-                if canonical_id(dev.id) == canonical_id(assigned_device_id):
-                    camera = CameraController(amcam.Amcam.Open(dev.id))
-                    break
-            except Exception:
-                # Some platforms may not support comparison of the id
-                # attribute – ignore and continue searching.
-                pass
-    # Fallback: If no configuration or match, do not auto-connect.  A
-    # missing connection will cause API endpoints to return HTTP 503.
+
+    if assigned_device_serial:
+        h = _find_and_open_by_serial(assigned_device_serial)
+        if h is not None:
+            # Wrap the live handle in our controller, which starts streaming.
+            camera = CameraController(h)
+            return
+    # Otherwise, remain idle (the API will report "Camera not connected.")
 
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
+    """Cleanly stop streaming and close the camera on process shutdown."""
     global camera
     if camera:
         camera.close()
@@ -313,25 +533,24 @@ def _shutdown() -> None:
 
 
 # ───────────────────────── API routes ─────────────────────────────────
-
 @app.get("/get_status")
 def status():
-    """Return width/height, gain, exposure, AE flag and FPS."""
+    """Return width/height, gain, exposure, AE flag and FPS as JSON."""
     return ensure_cam().status()
 
 
 @app.post("/set_gain")
 def set_gain(req: GainRequest):
-    """Force manual mode then set electronic gain (%)."""
+    """Disable auto-exposure, then set the electronic gain (percent)."""
     cam = ensure_cam()
     cam.set_auto_exp(False)
     cam.set_gain(req.gain)
     return {"gain": req.gain}
 
 
-@app.post("/get_exposure")
+@app.post("/set_exposure")
 def set_exposure(req: ExposureRequest):
-    """Validate range, disable AE, then set exposure time (µs)."""
+    """Validate range, disable auto-exposure, then set exposure (µs)."""
     cam = ensure_cam()
     lo, hi, _ = cam.hcam.get_ExpTimeRange()
     if not lo <= req.us <= hi:
@@ -351,7 +570,7 @@ def set_auto_exp_endpoint(req: AutoExpRequest):
 
 @app.post("/set_resolution")
 def set_resolution_endpoint(req: ResolutionRequest):
-    """Switch to "high", "mid" or "low" pre-defined sensor size."""
+    """Switch to \"high\", \"mid\" or \"low\" sensor size preset."""
     cam = ensure_cam()
     try:
         cam.set_resolution(req.mode)
@@ -366,11 +585,11 @@ def set_resolution_endpoint(req: ResolutionRequest):
     responses={200: {"content": {"image/png": {}}}},
 )
 def frame():
-    """
-    Return the most recent RGB frame as PNG bytes.
+    """Return the most recent RGB frame as PNG bytes.
 
-    Heavy PNG encoding happens *here* (FastAPI thread), not in the SDK
-    callback, so streaming stays smooth.
+    Internally, we convert the raw RGB buffer into a Pillow Image, encode it
+    to PNG in-memory, then send those bytes as the HTTP response. Browsers
+    and most clients can display or save this as a still image.
     """
     cam = ensure_cam()
     with cam._raw_lock:
@@ -382,6 +601,7 @@ def frame():
         (cam.w, cam.h),
         raw,
         "raw",
+        # Some firmware use BGR byte order; the SDK exposes a flag for that.
         "BGR" if cam.hcam.get_Option(amcam.AMCAM_OPTION_BYTEORDER) else "RGB",
         0,
         1,
@@ -394,73 +614,13 @@ def frame():
         headers={"Cache-Control": "no-store"},
     )
 
-def canonical_id(dev_id: str) -> str:
-    """
-    Return the USB-ID with the volatile *third* token stripped.
-
-    Example
-    -------
-    'tp-1-7-1351-25360'   →  'tp-1-1351-25360'
-    'tp-1-13-1351-25360'  →  'tp-1-1351-25360'
-    """
-    parts = str(dev_id).split('-')
-    if len(parts) >= 5:
-        del parts[2]               # drop the port number
-    return '-'.join(parts)
-
-@app.get("/get_ping")
-def ping():
-    """
-    Health check for the backend.
-
-    This endpoint reports whether the assigned camera (as configured by
-    ``setup.py``) is physically attached to the system.  If the device
-
-    configuration file has not been created the status is reported as
-    ``not-configured``.
-
-    """
-    load_config()  # reload in case the config was updated while running
-    status: str
-    name: Optional[str]
-    if assigned_device_id is None:
-        status = "not-configured"
-        name = None
-    else:
-        # Enumerate currently connected devices and see if the assigned ID
-        # appears in the list.  ``amcam.Amcam.EnumV2`` returns objects
-        # whose ``id`` attribute matches the string saved in the config.
-        cams = amcam.Amcam.EnumV2()
-        found = False
-        for dev in cams:
-            #printouts for debugging purposes
-            #the returned device id varies by one number by plugging and replugging the camera for some reason, we will remove this single number to perform the conditional
-            #print("assigned id:" + assigned_device_id)
-            #print(dev.id)
-            try:
-                for dev in cams:
-                    dev_id_canon = canonical_id(dev.id)
-                    assigned_id_canon = canonical_id(assigned_device_id)
-                    if dev_id_canon == assigned_id_canon:
-                        found = True
-                        break
-            except Exception:
-                pass
-        status = "connected" if found else "not-connected"
-        name = assigned_device_name
-    return {"status": status, "name": name}
-
-from fastapi.responses import StreamingResponse
-
-import cv2
-import numpy as np
 
 @app.get("/get_stream")
 def stream():
-    """
-    MJPEG stream of the live camera feed.
-    Streamed as multipart/x-mixed-replace.
-    Compatible with most web browsers.
+    """Return an MJPEG stream of the live camera feed (browser-friendly).
+
+    This uses HTTP multipart/x-mixed-replace where each part is a JPEG frame.
+    Most browsers can render this as a live <img> source.
     """
     cam = ensure_cam()
 
@@ -471,7 +631,6 @@ def stream():
             if raw is None:
                 time.sleep(0.01)
                 continue
-            # Convert to RGB image
             img = Image.frombuffer(
                 "RGB",
                 (cam.w, cam.h),
@@ -481,29 +640,44 @@ def stream():
                 0,
                 1,
             )
-            # Convert to JPEG (in-memory)
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=80)
             frame = buf.getvalue()
 
-            # Yield in MJPEG format
+            # Yield one JPEG part following the multipart MJPEG format.
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n"
                 b"Content-Length: " + f"{len(frame)}".encode() + b"\r\n\r\n" +
                 frame + b"\r\n"
             )
-            time.sleep(0.01)  # ~100 FPS max
+            time.sleep(0.01)  # ~100 FPS max; adjust as desired
 
     return StreamingResponse(
         mjpeg_generator(),
-        media_type="multipart/x-mixed-replace; boundary=frame"
+        media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
-# The following endpoints have intentionally been removed from the public
-# interface: ``/get_cameras``, ``/set_connected`` and ``/set_disconnected``.
-# These routes previously allowed clients to enumerate cameras and switch
-# between them by index.  In a one-device-per-container model such
-# functionality is undesirable because it can lead to accidental control
-# of the wrong device.  The helper functions remain available internally
-# (e.g. ``list_cameras()``) for use by setup scripts or debugging.
+
+# ───────────────────────── health check ───────────────────────────────
+@app.get("/get_ping")
+def ping():
+    """Health check reporting one of: connected / not-connected / not-configured.
+
+    - "connected": we found the configured serial currently attached
+    - "not-connected": config has a serial, but it isn't present now
+    - "not-configured": no serial is configured in device_config.json
+    """
+    load_config()  # reload in case the config was updated while running
+    name: Optional[str] = assigned_device_name
+
+    if assigned_device_serial:
+        status = "connected" if _serial_present(assigned_device_serial) else "not-connected"
+    else:
+        status = "not-configured"
+        name = None
+
+    return {"status": status, "name": name}
+
+
+# No public enumeration/switch routes and absolutely no device_id handling.
